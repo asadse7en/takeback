@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Preferences (Takeback mockup)</title>
+
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700&display=swap">
+<style>
+body{margin:0}*{box-sizing:border-box}
+.w{width:1100px;height:720px;background:#F6F3EF;color:#1F1B16;font-family:"Segoe UI Variable Text","Segoe UI",Inter,system-ui,sans-serif;font-size:14px;display:flex;flex-direction:column;border:1px solid #D9D2C8;border-radius:8px;overflow:hidden}
+.tb{height:40px;display:flex;align-items:center;justify-content:space-between;padding-left:14px;font-size:12px;flex:none}
+.tb span{display:flex;align-items:center;gap:10px}.cp{display:flex}.cp button{width:46px;height:40px;border:0;background:none;display:flex;align-items:center;justify-content:center}
+.ct{flex:1;padding:8px 48px 0;display:flex;flex-direction:column;gap:14px;min-height:0}
+h1{margin:0;font-size:28px;font-weight:600;line-height:36px}.sub{color:#6B6359;margin-top:2px}
+.gl{font-weight:600;margin:6px 0 -4px}
+.card{background:#fff;border:1px solid #E8E2DA;border-radius:8px}
+.row{display:flex;align-items:center;gap:14px;min-height:50px;padding:6px 16px;border-bottom:1px solid #F0EAE2}.row:last-child{border:0}
+.row .t{flex:1}.row .d{color:#6B6359;font-size:12px;margin-top:1px}
+.ic{width:20px;height:20px;flex:none}
+.btn{height:32px;padding:0 16px;border-radius:4px;border:1px solid #D9D2C8;background:#fff;font:inherit;color:#1F1B16}
+.ac{background:#FDB366;border-color:#E89B4C;color:#2A1500;font-weight:600}
+.dd{width:150px;height:32px;border:1px solid #D9D2C8;border-radius:4px;display:flex;align-items:center;justify-content:space-between;padding:0 10px;background:#fff}
+.tg{width:40px;height:20px;border-radius:10px;border:1px solid #8C8479;position:relative;flex:none}.tg i{position:absolute;top:4px;left:4px;width:10px;height:10px;border-radius:5px;background:#8C8479}
+.tg.on{background:#FDB366;border-color:#E89B4C}.tg.on i{left:23px;width:12px;height:12px;top:3px;background:#2A1500}
+.ft{height:68px;border-top:1px solid #E8E2DA;background:#FBF9F6;display:flex;align-items:center;justify-content:space-between;padding:0 48px;flex:none}
+.ib{display:flex;gap:12px;align-items:center;background:#FFF1E2;border:1px solid #F7D9B8;border-radius:4px;padding:10px 14px}
+.pb{height:4px;border-radius:2px;background:#E8E2DA}.pb i{display:block;height:4px;width:64%;border-radius:2px;background:#E8892E}
+.dz{border:1.5px dashed #E8A867;border-radius:8px;background:#FFF6EC;height:170px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px}
+.ok{color:#2F7D3C;display:flex;align-items:center;gap:6px;font-size:13px}button{cursor:pointer}.w{position:relative}
+.sg2{display:flex;background:#F0EAE2;border-radius:6px;padding:2px;flex:none}.sg2 button{border:0;background:none;font:inherit;font-size:12px;padding:4px 11px;border-radius:4px;color:#6B6359}
+.sg2 button.a{background:#fff;color:#1F1B16;font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.15)}
+.ri{width:30px;height:30px;border-radius:15px;background:#FFF1E2;display:flex;align-items:center;justify-content:center;flex:none}
+.ln{display:flex;align-items:center;gap:8px;height:26px;font-size:13px}.fn{font-weight:600}.fl{font-size:12.5px}.sw{width:24px;height:16px;border-radius:3px;flex:none}
+.tag{background:#FFF1E2;color:#B8530A;border-radius:10px;padding:1px 8px;font-size:11px;font-weight:600}
+.nv{position:relative;display:flex;align-items:center;gap:10px;height:40px;padding:0 12px;border:0;border-radius:6px;background:none;font:inherit;color:#1F1B16;text-align:left}
+.nv.sel{background:#fff;font-weight:600}.nv.sel::before{content:"";position:absolute;left:0;top:10px;bottom:10px;width:3px;border-radius:2px;background:#E8892E}
+.bd{position:absolute;inset:0;background:rgba(31,27,22,.38);display:flex;align-items:center;justify-content:center}
+.dlg{background:#FBF9F6;border:1px solid #D9D2C8;border-radius:8px;box-shadow:0 14px 44px rgba(0,0,0,.28);width:680px;display:flex;flex-direction:column}
+.tab{border:0;background:none;font:inherit;padding:10px 14px;color:#6B6359;border-bottom:2px solid transparent}.tab.sel{color:#1F1B16;font-weight:600;border-bottom-color:#E8892E}
+.chip{background:#F6F3EF;border:1px solid #E8E2DA;border-radius:12px;padding:3px 10px;font-size:12px}
+.gt{font-size:18px;font-weight:600;margin:0 0 10px}
+button.tg{background:transparent;padding:0}.dis{opacity:.4;pointer-events:none}.ln{height:26px;font-size:14px;display:flex;align-items:center;gap:0}.lc{display:flex;align-items:center;gap:8px;margin-left:2px}.gc{width:24px;height:26px;position:relative;flex:none}.gc.v::before,.gc.t::before,.gc.l::before{content:"";position:absolute;left:8px;top:0;border-left:1.5px solid #DCCBB4}.gc.v::before,.gc.t::before{bottom:0}.gc.l::before{height:14px}.gc.t::after,.gc.l::after{content:"";position:absolute;left:8px;right:2px;top:13px;border-top:1.5px solid #DCCBB4}.pv{scrollbar-width:none;outline:none;overscroll-behavior:contain;padding-bottom:26px}.pv::-webkit-scrollbar{display:none}.pv:focus-visible{outline:2px solid #FDB366;outline-offset:2px;border-radius:6px}.pvw::after{content:"";position:absolute;left:0;right:0;bottom:0;height:30px;background:linear-gradient(rgba(255,255,255,0),#fff);pointer-events:none}.fl{font-size:14px}.fn{font-size:14px}.tag{font-size:12px;padding:2px 9px}
+.cb{display:flex;align-items:center;gap:7px;border:0;background:none;font:inherit;font-size:13px;padding:4px 6px;color:#1F1B16}.bx{width:18px;height:18px;border:1.5px solid #8C8479;border-radius:4px;display:inline-block;position:relative;box-sizing:border-box;flex:none}.cb.a .bx{background:#FDB366;border-color:#E89B4C}.cb.a .bx::after{content:"";position:absolute;left:4.5px;top:1px;width:5px;height:9px;border:solid #2A1500;border-width:0 2px 2px 0;transform:rotate(45deg)}
+h1{font-family:"Bricolage Grotesque","Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;font-size:32px;font-weight:700;letter-spacing:-.6px;line-height:36px}
+</style>
+
+<style>html{background:#E9E5DE}body{margin:0;padding:24px;display:flex;justify-content:center}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/x-template" id="tpl">
+
+<div class="w">
+<div class="tb"><span><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect width="16" height="16" rx="4" fill="#FDB366"/><circle cx="8" cy="8" r="3" fill="none" stroke="#2A1500" stroke-width="1.6"/></svg>Takeback</span><div class="cp"><button aria-label="Minimize"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="#1F1B16" stroke-width="1" aria-hidden="true"><path d="M0 5h10"/></svg></button><button aria-label="Maximize"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="#1F1B16" stroke-width="1" aria-hidden="true"><rect x="0.5" y="0.5" width="9" height="9"/></svg></button><button aria-label="Close"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="#1F1B16" stroke-width="1" aria-hidden="true"><path d="M0 0l10 10M10 0L0 10"/></svg></button></div></div>
+<div class="ct"><div><h1>Preferences</h1><div class="sub">Choose how your library is organized.</div></div><div style="display:flex;gap:16px;flex:1;min-height:0;padding-bottom:14px"><div style="flex:1.35;min-width:0;min-height:0;display:flex;flex-direction:column;gap:12px"><div class="card" style="padding:12px 16px;flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column;justify-content:center;gap:8px"><div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px"><b>Output folder</b></div><div style="display:flex;gap:8px"><div style="flex:1;min-width:0;height:30px;border:1px solid #D9D2C8;border-radius:4px;background:#fff;display:flex;align-items:center;gap:8px;padding:0 10px"><svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M2 5h6l2 2h8v9H2z"/></svg><span style="font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ pathText }}</span></div><button class="btn" onClick="{{ browse }}">Browse</button></div><div><div style="display:flex;height:10px;border-radius:5px;overflow:hidden;background:#E4DED3"><i style="display:block;width:{{ usedW }}%;background:#8C8479;border-right:2px solid #fff"></i><i style="display:block;width:{{ needW }}%;background:#E8892E"></i></div><div style="display:flex;align-items:center;gap:16px;margin-top:8px;font-size:12.5px"><span style="color:#6B6359">{{ drive }}</span><span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#8C8479;margin-right:6px;vertical-align:-1px"></span>{{ usedTxt }} used</span><span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#E8892E;margin-right:6px;vertical-align:-1px"></span>131 GB this export</span><span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#E4DED3;border:1px solid #CFC6B8;box-sizing:border-box;margin-right:6px;vertical-align:-1px"></span>{{ freeAfter }} free after</span></div></div></div><div><div class="card"><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="6" width="12" height="10" rx="2"/><path d="M5 3h11a2 2 0 012 2v9"/></svg></span><div class="t">Albums<div class="d">{{ albumHelp }}</div></div><div class="sg2"><button class="{{ a_albumMode_off }}" onClick="{{ s_albumMode_off }}">Off</button><button class="{{ a_albumMode_move }}" onClick="{{ s_albumMode_move }}">Move</button><button class="{{ a_albumMode_link }}" onClick="{{ s_albumMode_link }}">Link</button><button class="{{ a_albumMode_copy }}" onClick="{{ s_albumMode_copy }}">Copy</button></div></div><div class="row " style="min-height:42px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="14" height="13" rx="2"/><path d="M3 8h14M7 11h2M11 11h2M7 14h2"/></svg></span><div class="t">Date folders</div><div class="sg2"><button class="{{ a_dateFolders_off }}" onClick="{{ s_dateFolders_off }}">Off</button><button class="{{ a_dateFolders_year }}" onClick="{{ s_dateFolders_year }}">Year</button><button class="{{ a_dateFolders_month }}" onClick="{{ s_dateFolders_month }}">Year › Month</button></div></div><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 2.5l2.3 4.8 5.2.7-3.8 3.6.9 5.2L10 14.3 5.4 16.8l.9-5.2L2.5 8l5.2-.7z"/></svg></span><div class="t">Favorites<div class="d">1,032 starred photos found</div></div><div class="sg2"><button class="{{ a_favMode_off }}" onClick="{{ s_favMode_off }}">Off</button><button class="{{ a_favMode_move }}" onClick="{{ s_favMode_move }}">Move</button><button class="{{ a_favMode_link }}" onClick="{{ s_favMode_link }}">Link</button><button class="{{ a_favMode_copy }}" onClick="{{ s_favMode_copy }}">Copy</button></div></div><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="16" height="4" rx="1"/><path d="M4 8v8h12V8M8 12h4"/></svg></span><div class="t">Archive<div class="d">214 archived photos found</div></div><button class="tg {{ c_archive }}" onClick="{{ t_archive }}" aria-label="archive"><i></i></button></div><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 17l1-4L14 3l3 3L7 16z"/></svg></span><div class="t">Edited photos<div class="d">2,140 edited photos found</div></div><div class="sg2 "><button class="{{ a_edVer_both }}" onClick="{{ s_edVer_both }}">Keep both</button><button class="{{ a_edVer_orig }}" onClick="{{ s_edVer_orig }}">Originals only</button><button class="{{ a_edVer_edit }}" onClick="{{ s_edVer_edit }}">Edited only</button></div></div><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="10" r="8"/><circle cx="10" cy="10" r="4"/></svg></span><div class="t">Keep live photos together<div class="d">340 live photos found</div></div><div style="display:flex;align-items:center;gap:12px"><sc-if value="{{ liveOn }}" hint-placeholder-val="{{ true }}"><span class="tag">{{ liveTag }}</span></sc-if><button class="tg {{ c_merge }}" onClick="{{ t_merge }}" aria-label="merge"><i></i></button></div></div><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1"/><rect x="11" y="3" width="6" height="6" rx="1"/><rect x="3" y="11" width="6" height="6" rx="1"/><rect x="11" y="11" width="6" height="6" rx="1"/></svg></span><div class="t">Sort into folders by type<div class="d">Inside every album and date folder</div></div><div style="display:flex;gap:6px"><button class="cb {{ a_splitPhoto }}" onClick="{{ t_splitPhoto }}"><span class="bx"></span>Photos</button><button class="cb {{ a_splitVideo }}" onClick="{{ t_splitVideo }}"><span class="bx"></span>Videos</button><button class="cb {{ a_splitLive }}" onClick="{{ t_splitLive }}"><span class="bx"></span>Live</button></div></div><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="14" height="14" rx="3"/><path d="M7 10h6"/></svg></span><div class="t">Advanced options<div class="d">{{ advSummary }}</div></div><button class="btn" onClick="{{ openAdv }}">Open</button></div></div></div></div><div class="card" style="flex:1;padding:14px 16px;display:flex;flex-direction:column;min-width:0;min-height:0"><div style="display:flex;align-items:center;justify-content:space-between;gap:8px"><b>Output preview</b></div><div class="pvw" style="margin-top:8px;flex:1;min-height:0;position:relative;display:flex;flex-direction:column"><div class="pv" tabindex="0" aria-label="Output preview, scrollable" style="flex:1;overflow-y:auto;min-height:0"><sc-for list="{{ lines }}" as="line" hint-placeholder-count="12"><div class="ln"><sc-for list="{{ line.guides }}" as="g" hint-placeholder-count="1"><div class="gc {{ g.c }}"></div></sc-for><div class="lc"><sc-if value="{{ line.isFolder }}" hint-placeholder-val="{{ true }}"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M2 5h6l2 2h8v9H2z"/></svg><span class="fn">{{ line.name }}</span></sc-if><sc-if value="{{ line.isFile }}" hint-placeholder-val="{{ false }}"><span class="fl">{{ line.name }}</span></sc-if><sc-if value="{{ line.hasTag }}" hint-placeholder-val="{{ false }}"><span class="tag">{{ line.tag }}</span></sc-if></div></div></sc-for></div></div></div></div></div>
+<div class="ft"><label style="display:flex;gap:10px;align-items:center"><span style="width:18px;height:18px;border:1.5px solid #8C8479;border-radius:4px;display:inline-block"></span>Preview only</label><div style="display:flex;gap:8px"><button class="btn">Back</button><button class="btn ac">Start</button></div></div>
+<sc-if value="{{ show_adv }}" hint-placeholder-val="{{ false }}"><div class="bd"><div class="dlg"><div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px 0"><b style="font-size:18px;font-weight:600">Advanced options</b><button class="btn" style="width:32px;padding:0;border-color:transparent;background:none" onClick="{{ closeAdv }}" aria-label="Close"><svg class="ic" width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="#6B6359" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15"/></svg></button></div><div style="display:flex;padding:6px 10px 0;border-bottom:1px solid #E8E2DA"><button class="tab {{ tb_folders }}" onClick="{{ go_folders }}">Folders</button><button class="tab {{ tb_names }}" onClick="{{ go_names }}">Names and duplicates</button><button class="tab {{ tb_dates }}" onClick="{{ go_dates }}">Dates and metadata</button><button class="tab {{ tb_more }}" onClick="{{ go_more }}">More</button></div><div style="padding:16px 18px;height:300px;overflow:hidden"><sc-if value="{{ show_folders }}" hint-placeholder-val="{{ true }}"><div class="card"><div class="row {{ d_albumLoc }}" style="min-height:42px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="14" height="13" rx="2"/><path d="M3 8h14M7 2v3M13 2v3"/></svg></span><div class="t">Where albums go</div><div class="sg2 "><button class="{{ a_albumLoc_top }}" onClick="{{ s_albumLoc_top }}">Top level</button><button class="{{ a_albumLoc_year }}" onClick="{{ s_albumLoc_year }}">Inside year folders</button></div></div><div class="row {{ d_copyAll }}" style="min-height:42px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M13 4H5a2 2 0 00-2 2v8"/></svg></span><div class="t">Photo in several albums</div><div class="sg2 "><button class="{{ a_copyAll_first }}" onClick="{{ s_copyAll_first }}">First album only</button><button class="{{ a_copyAll_all }}" onClick="{{ s_copyAll_all }}">Keep in all</button></div></div><div class="row {{ d_editedMode }}" style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 17l1-4L14 3l3 3L7 16z"/></svg></span><div class="t">Edited photos folder<div class="d">Collect edited versions in one folder</div></div><div class="sg2 "><button class="{{ a_editedMode_off }}" onClick="{{ s_editedMode_off }}">Off</button><button class="{{ a_editedMode_move }}" onClick="{{ s_editedMode_move }}">Move</button><button class="{{ a_editedMode_link }}" onClick="{{ s_editedMode_link }}">Link</button><button class="{{ a_editedMode_copy }}" onClick="{{ s_editedMode_copy }}">Copy</button></div></div><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h12M8 6V4h4v2M6 6l1 11h6l1-11"/></svg></span><div class="t">Trashed items<div class="d">18 found in your export</div></div><div class="sg2 "><button class="{{ a_trash_skip }}" onClick="{{ s_trash_skip }}">Skip</button><button class="{{ a_trash_incl }}" onClick="{{ s_trash_incl }}">Include</button><button class="{{ a_trash_own }}" onClick="{{ s_trash_own }}">Own folder</button></div></div><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 17l1-4L14 3l3 3L7 16z"/></svg></span><div class="t">Folder names<div class="d">Favorites, Archive, Edited, Unsorted</div></div><button class="btn">Rename</button></div></div></sc-if><sc-if value="{{ show_names }}" hint-placeholder-val="{{ false }}"><div class="card"><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h9"/></svg></span><div class="t">File names<div class="d">Example: IMG_4821.jpg</div></div><div class="dd" style="width:176px;font-size:13px">Keep original<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="#6B6359" stroke-width="1.4" aria-hidden="true"><path d="M2 4l4 4 4-4"/></svg></div></div><div class="row " style="min-height:42px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M13 4H5a2 2 0 00-2 2v8"/></svg></span><div class="t">If two files have the same name</div><div class="dd" style="width:176px;font-size:13px">Add a number<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="#6B6359" stroke-width="1.4" aria-hidden="true"><path d="M2 4l4 4 4-4"/></svg></div></div><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M13 4H5a2 2 0 00-2 2v8"/></svg></span><div class="t">Ignore exact duplicates<div class="d">Compared by content, also against files already in the output</div></div><button class="tg {{ c_dups }}" onClick="{{ t_dups }}" aria-label="dups"><i></i></button></div><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 2h7l3 3v13H5z"/><path d="M8 10h4M8 13h4"/></svg></span><div class="t">Files without JSON<div class="d">128 files found</div></div><div class="sg2 "><button class="{{ a_noJson_leave }}" onClick="{{ s_noJson_leave }}">Leave in place</button><button class="{{ a_noJson_uns }}" onClick="{{ s_noJson_uns }}">Unsorted folder</button></div></div></div></sc-if><sc-if value="{{ show_dates }}" hint-placeholder-val="{{ false }}"><div class="card"><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="10" r="8"/><path d="M10 5v5l3 2"/></svg></span><div class="t">Time zone<div class="d">Local = where the photo was taken</div></div><div class="sg2 "><button class="{{ a_timeZone_local }}" onClick="{{ s_timeZone_local }}">Local</button><button class="{{ a_timeZone_computer }}" onClick="{{ s_timeZone_computer }}">Computer</button><button class="{{ a_timeZone_utc }}" onClick="{{ s_timeZone_utc }}">UTC</button></div></div><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="14" height="13" rx="2"/><path d="M3 8h14M7 11h2M11 11h2M7 14h2"/></svg></span><div class="t">If a photo has no date<div class="d">Used when there is no JSON or EXIF date</div></div><div class="sg2 "><button class="{{ a_noDate_name }}" onClick="{{ s_noDate_name }}">File name</button><button class="{{ a_noDate_file }}" onClick="{{ s_noDate_file }}">File date</button><button class="{{ a_noDate_none }}" onClick="{{ s_noDate_none }}">Leave blank</button></div></div><div class="row " style="min-height:42px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 18s6-5.5 6-10a6 6 0 10-12 0c0 4.5 6 10 6 10z"/><circle cx="10" cy="8" r="2"/></svg></span><div class="t">Write location (GPS)</div><button class="tg {{ c_gps }}" onClick="{{ t_gps }}" aria-label="gps"><i></i></button></div><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="14" height="12" rx="2"/><path d="M6 8h8M6 12h5"/></svg></span><div class="t">Write descriptions and people tags<div class="d">From Google Photos</div></div><button class="tg {{ c_descr }}" onClick="{{ t_descr }}" aria-label="descr"><i></i></button></div><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 2.5l2.3 4.8 5.2.7-3.8 3.6.9 5.2L10 14.3 5.4 16.8l.9-5.2L2.5 8l5.2-.7z"/></svg></span><div class="t">Rate favorites 5 stars<div class="d">Shows as 5 stars in Windows Explorer and other apps</div></div><button class="tg {{ c_rating }}" onClick="{{ t_rating }}" aria-label="rating"><i></i></button></div></div></sc-if><sc-if value="{{ show_more }}" hint-placeholder-val="{{ false }}"><div class="card"><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="14" height="14" rx="3"/><path d="M7 10h6"/></svg></span><div class="t">Live photo style<div class="d">Experimental: iPhone and Android change the photo file</div></div><div class="sg2 "><button class="{{ a_liveStyle_sep }}" onClick="{{ s_liveStyle_sep }}">Separate</button><button class="{{ a_liveStyle_iphone }}" onClick="{{ s_liveStyle_iphone }}">iPhone</button><button class="{{ a_liveStyle_android }}" onClick="{{ s_liveStyle_android }}">Android</button></div></div><div class="row " style="min-height:44px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h12M8 6V4h4v2M6 6l1 11h6l1-11"/></svg></span><div class="t">Delete each zip after it is processed<div class="d">Frees space as it goes. Permanent: asks you to confirm.</div></div><button class="tg {{ c_deleteZips }}" onClick="{{ t_deleteZips }}" aria-label="deleteZips"><i></i></button></div><div class="row " style="min-height:42px;padding:4px 16px"><span class="ri"><svg class="ic" width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="#B8530A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 15a7 7 0 1114 0"/><path d="M10 15l3-5"/></svg></span><div class="t">Speed</div><div class="sg2 "><button class="{{ a_speed_bal }}" onClick="{{ s_speed_bal }}">Balanced</button><button class="{{ a_speed_gentle }}" onClick="{{ s_speed_gentle }}">Gentle on my PC</button></div></div></div></sc-if></div><div style="display:flex;justify-content:flex-end;padding:12px 18px;border-top:1px solid #E8E2DA;background:#F6F3EF;border-radius:0 0 8px 8px"><button class="btn ac" onClick="{{ closeAdv }}">Done</button></div></div></div></sc-if><sc-if value="{{ show_confirm }}" hint-placeholder-val="{{ false }}"><div class="bd" style="background:rgba(31,27,22,.5)"><div class="dlg" style="width:480px"><div style="padding:18px 20px 6px"><b style="font-size:18px;font-weight:600">Delete each zip after it is processed?</b></div><div style="padding:0 20px 16px;color:#6B6359;line-height:20px">Each Takeout file is permanently deleted once its photos are saved and checked. It does not go to the Recycle Bin or Trash. To run Takeback again you would need to download your Takeout again. Your Google Photos library is not affected.</div><div style="display:flex;justify-content:flex-end;gap:8px;padding:12px 18px;border-top:1px solid #E8E2DA;background:#F6F3EF;border-radius:0 0 8px 8px"><button class="btn" onClick="{{ confirmOff }}">Cancel</button><button class="btn ac" onClick="{{ confirmOn }}">Delete zips as I go</button></div></div></div></sc-if>
+</div>
+</script>
+<script>
+class DCLogic {
+  constructor(props) { this.props = props || {}; this.state = {}; }
+  setState(o) { this.state = Object.assign({}, this.state, o); window.__rerender(); }
+}
+(function () {
+  var holeRe = /\{\{\s*([^}]+?)\s*\}\}/g;
+  function ev(expr, scope) {
+    expr = String(expr).trim();
+    if (expr === 'true') return true;
+    if (expr === 'false') return false;
+    var parts = expr.split('.'), v = scope[parts[0]];
+    for (var i = 1; i < parts.length && v != null; i++) v = v[parts[i]];
+    return v;
+  }
+  function holeOnly(s) { var m = /^\s*\{\{\s*([^}]+?)\s*\}\}\s*$/.exec(s || ''); return m ? m[1] : null; }
+  function interp(s, scope) {
+    return s.replace(holeRe, function (m, e) { var v = ev(e, scope); return v == null || typeof v === 'function' ? '' : String(v); });
+  }
+  function kids(node, scope, out) { node.childNodes.forEach(function (c) { render(c, scope, out); }); }
+  function render(node, scope, out) {
+    if (node.nodeType === 3) { out.appendChild(document.createTextNode(interp(node.nodeValue, scope))); return; }
+    if (node.nodeType !== 1) return;
+    var tag = node.localName;
+    if (tag === 'sc-if') { var c = holeOnly(node.getAttribute('value')); if (c !== null ? ev(c, scope) : node.getAttribute('value')) kids(node, scope, out); return; }
+    if (tag === 'sc-for') {
+      var l = holeOnly(node.getAttribute('list')), as = node.getAttribute('as'), arr = (l !== null ? ev(l, scope) : null) || [];
+      arr.forEach(function (item) { var sc = Object.assign({}, scope); sc[as] = item; kids(node, sc, out); });
+      return;
+    }
+    var el = document.createElementNS(node.namespaceURI, node.localName);
+    Array.prototype.forEach.call(node.attributes, function (a) {
+      if (a.name.indexOf('hint-') === 0) return;
+      if (a.name === 'onclick') { var h = holeOnly(a.value); var fn = h !== null ? ev(h, scope) : null; if (typeof fn === 'function') el.addEventListener('click', fn); return; }
+      el.setAttribute(a.name, interp(a.value, scope));
+    });
+    kids(node, scope, el);
+    out.appendChild(el);
+  }
+  window.__boot = function (Component) {
+    var comp = new Component({}), root = document.getElementById('root');
+    var t = document.createElement('template'); t.innerHTML = document.getElementById('tpl').textContent;
+    window.__rerender = function () {
+      var frag = document.createDocumentFragment(), vals = comp.renderVals();
+      t.content.childNodes.forEach(function (n) { render(n, vals, frag); });
+      root.replaceChildren(frag);
+    };
+    window.__rerender();
+  };
+})();
+
+
+class Component extends DCLogic {
+renderVals() {
+const D = {folder:0,albumMode:'move',albumLoc:'top',dateFolders:'month',copyAll:'first',timeZone:'local',noDate:'name',merge:true,splitPhoto:false,splitVideo:false,splitLive:false,archive:true,favMode:'link',editedMode:'move',edVer:'both',trash:'skip',noJson:'uns',dups:true,gps:true,descr:true,rating:true,liveStyle:'sep',deleteZips:false,speed:'bal'};
+const s = Object.assign({}, D, {adv:false,tab:'folders'}, this.state || {});
+const set = (k, v) => () => this.setState({[k]: v});
+const tog = (k) => () => this.setState({[k]: !s[k]});
+const root = [{n:'Photo Library',p:'C:\\Users\\You\\Pictures\\Photo Library',g:'Drive C:',us:'100 GB',fa:'281 GB',u:19.5,nw:25.6},{n:'My Photos',p:'D:\\My Photos',g:'Drive D:',us:'160 GB',fa:'709 GB',u:16,nw:13.1},{n:'Photo Library',p:'D:\\Backup\\Photo Library',g:'Drive D:',us:'160 GB',fa:'709 GB',u:16,nw:13.1}][s.folder];
+const albumHelp = {off:'No album folders, everything sorted by date',move:'Each photo lives in its first album, the rest by date',link:'Originals stay by date, albums hold links',copy:'Originals stay by date, albums hold copies'}[s.albumMode];
+const SPECIAL = ['Archive','Favorites','Edited','Trash','Unsorted'];
+const mk = (name) => ({name, kids: [], files: [], rank: SPECIAL.indexOf(name) >= 0 ? 1 : 0});
+const top = mk(root.n);
+const items = [
+{n:'IMG_4821.jpg',t:'photo',al:['Paris trip','Best of 2024'],hasEd:1,y:'2024',m:'06'},
+{n:'PXL_0612.jpg',t:'live',al:['Paris trip'],y:'2024',m:'06'},
+{n:'VID_0099.mp4',t:'video',al:[],y:'2024',m:'06'},
+{n:'IMG_4900.jpg',t:'photo',al:[],fav:1,y:'2024',m:'06'},
+{n:'IMG_3100.jpg',t:'photo',al:[],arch:1,y:'2024',m:'03'},
+{n:'IMG_4821-edited.jpg',t:'photo',al:['Paris trip'],ed:1,y:'2024',m:'06'},
+{n:'IMG_0201.jpg',t:'photo',al:[],trashed:1,y:'2023',m:'11'},
+{n:'IMG_0099.jpg',t:'photo',al:[],nojson:1,y:'2022',m:'01'}];
+const add = (path, it, tag) => {
+let nd = top;
+path.forEach((p) => { let c = nd.kids.find((x) => x.name === p); if (!c) { c = mk(p); nd.kids.push(c); } nd = c; });
+nd.files.push({name: it.n, tag: tag || (it.t === 'live' ? 'Live' : '')});
+};
+const typ = (it) => it.t === 'photo' ? 'Photos' : it.t === 'video' ? 'Videos' : 'Live photos';
+const sp = (p, it) => (it.t === 'photo' ? s.splitPhoto : it.t === 'video' ? s.splitVideo : s.splitLive) ? p.concat([typ(it)]) : p;
+const cap = (x) => x === 'link' ? 'Link' : 'Copy';
+items.forEach((it) => {
+if (it.ed && s.edVer === 'orig') return;
+if (it.hasEd && s.edVer === 'edit') return;
+if (it.trashed && s.trash === 'skip') return;
+if (it.nojson) { if (s.noJson === 'uns') add(['Unsorted'], it, ''); return; }
+const yp = s.dateFolders === 'month' ? [it.y, it.m] : s.dateFolders === 'year' ? [it.y] : [];
+const ap = (a) => s.albumLoc === 'year' ? [it.y, a] : [a];
+let main = sp(yp, it);
+const extra = [];
+if (s.albumMode === 'move' && it.al.length) {
+main = sp(ap(it.al[0]), it);
+if (s.copyAll === 'all') it.al.slice(1).forEach((a) => extra.push([sp(ap(a), it), 'Copy']));
+} else if ((s.albumMode === 'link' || s.albumMode === 'copy') && it.al.length) {
+it.al.forEach((a) => extra.push([sp(ap(a), it), cap(s.albumMode)]));
+}
+if (it.arch && s.archive) main = ['Archive'];
+if (it.trashed && s.trash === 'own') main = ['Trash'];
+if (it.fav && s.favMode !== 'off') { if (s.favMode === 'move') main = ['Favorites']; else extra.push([['Favorites'], cap(s.favMode)]); }
+if (it.ed && s.editedMode !== 'off') { if (s.editedMode === 'move') main = ['Edited']; else extra.push([['Edited'], cap(s.editedMode)]); }
+add(main, it, '');
+extra.forEach((e) => add(e[0], it, e[1]));
+});
+const lines = [];
+const L = (o) => lines.push(Object.assign({isFolder: false, isFile: false, name: '', guides: [], hasTag: false, tag: ''}, o));
+const guidesFor = (flags, d, last) => { if (d === 0) return []; const g = flags.slice(0, d - 1).map((l) => ({c: l ? '' : 'v'})); g.push({c: last ? 'l' : 't'}); return g; };
+const walk = (nd, d, flags, last) => {
+let name = nd.name; let cur = nd;
+while (d > 0 && cur.kids.length === 1 && cur.files.length === 0) { cur = cur.kids[0]; name += ' \u203a ' + cur.name; }
+L({isFolder: true, name: name, guides: guidesFor(flags, d, last)});
+const ch = cur.kids.slice().sort((a, b) => a.rank - b.rank).map((k) => ({k: k})).concat(cur.files.map((f) => ({f: f})));
+const nf = d === 0 ? flags : flags.concat([last]);
+ch.forEach((c, i) => {
+const l = i === ch.length - 1;
+if (c.k) walk(c.k, d + 1, nf, l);
+else L({isFile: true, name: c.f.name, guides: guidesFor(nf, d + 1, l), hasTag: !!c.f.tag, tag: c.f.tag});
+});
+};
+walk(top, 0, [], true);
+const advKeys = ['albumLoc','copyAll','editedMode','trash','noJson','dups','gps','descr','rating','liveStyle','deleteZips','speed','timeZone','noDate'];
+const changed = advKeys.filter((k) => s[k] !== D[k]).length;
+const o = {lines, pathText: root.p, drive: root.g, usedTxt: root.us, freeAfter: root.fa, usedW: root.u, needW: root.nw,
+advSummary: changed ? changed + ' changed from the defaults' : 'All defaults',
+browse: () => this.setState({folder: (s.folder + 1) % 3}),
+d_albumLoc: s.albumMode === 'off' ? 'dis' : '', d_copyAll: s.albumMode === 'move' ? '' : 'dis', d_editedMode: s.edVer !== 'orig' ? '' : 'dis',
+albumHelp: albumHelp, show_adv: s.adv, openAdv: () => this.setState({adv: true}), closeAdv: () => this.setState({adv: false})};
+['archive','merge','dups','gps','descr','rating','deleteZips','splitPhoto','splitVideo','splitLive'].forEach((k) => { o['c_' + k] = s[k] ? 'on' : ''; o['t_' + k] = tog(k); o['a_' + k] = s[k] ? 'a' : ''; });
+[['albumMode',['off','move','link','copy']],['dateFolders',['off','year','month']],['albumLoc',['top','year']],['timeZone',['local','computer','utc']],['noDate',['name','file','none']],['favMode',['off','move','link','copy']],['editedMode',['off','move','link','copy']],['edVer',['both','orig','edit']],['trash',['skip','incl','own']],['noJson',['leave','uns']],['liveStyle',['iphone','android','sep']],['copyAll',['first','all']],['speed',['bal','gentle']]].forEach((g) => g[1].forEach((v) => { o['a_' + g[0] + '_' + v] = s[g[0]] === v ? 'a' : ''; o['s_' + g[0] + '_' + v] = set(g[0], v); }));
+['folders','names','dates','more'].forEach((k) => { o['show_' + k] = s.tab === k; o['tb_' + k] = s.tab === k ? 'sel' : ''; o['go_' + k] = set('tab', k); });
+o.liveOn = s.merge; o.liveTag = {iphone:'iPhone style', android:'Android style', sep:'Separate files'}[s.liveStyle];
+o.show_confirm = !!s.confirmDel; o.confirmOn = () => this.setState({deleteZips: true, confirmDel: false}); o.confirmOff = () => this.setState({confirmDel: false});
+o.t_deleteZips = () => { if (s.deleteZips) this.setState({deleteZips: false}); else this.setState({confirmDel: true}); };
+return o;
+}
+}
+
+__boot(Component);
+</script>
+</body>
+</html>

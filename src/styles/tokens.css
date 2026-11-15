@@ -1,0 +1,116 @@
+@import '@fontsource/inter/400.css';
+@import '@fontsource/inter/500.css';
+@import '@fontsource/inter/600.css';
+@import '@fontsource/bricolage-grotesque/600.css';
+@import '@fontsource/bricolage-grotesque/700.css';
+
+:root {
+  color-scheme: light;
+
+  --tb-color-canvas: #F6F3EF;
+  --tb-color-surface: #FFFFFF;
+  --tb-color-footer: #FBF9F6;
+  --tb-color-border: #D9D2C8;
+  --tb-color-divider: #E8E2DA;
+  --tb-color-row-divider: #F0EAE2;
+  --tb-color-ink: #1F1B16;
+  --tb-color-muted: #6B6359;
+  --tb-color-accent: #FDB366;
+  --tb-color-accent-border: #E89B4C;
+  --tb-color-accent-ink: #2A1500;
+  --tb-color-accent-deep: #E8892E;
+  --tb-color-accent-text: #B8530A;
+  --tb-color-tint: #FFF1E2;
+  --tb-color-drop: #FFF6EC;
+  --tb-color-drop-border: #E8A867;
+  --tb-color-success: #2F7D3C;
+  --tb-color-danger: #C42B1C;
+  --tb-color-backdrop: rgb(31 27 22 / 38%);
+  --tb-color-guide: #DCCBB4;
+  --tb-color-disk-used: #8C8479;
+  --tb-color-disk-free: #E4DED3;
+
+  --tb-font-body: 'Inter', sans-serif;
+  --tb-font-display: 'Bricolage Grotesque', sans-serif;
+  --tb-font-size-2xs: 11px;
+  --tb-font-size-xs: 12px;
+  --tb-font-size-compact: 12.5px;
+  --tb-font-size-sm: 13px;
+  --tb-font-size-base: 14px;
+  --tb-font-size-lg: 16px;
+  --tb-font-size-heading-sm: 17px;
+  --tb-font-size-heading: 18px;
+  --tb-font-size-xl: 20px;
+  --tb-font-size-2xl: 22px;
+  --tb-font-size-3xl-sm: 24px;
+  --tb-font-size-3xl-md: 26px;
+  --tb-font-size-3xl-lg: 28px;
+  --tb-font-size-3xl-xl: 30px;
+  --tb-font-size-3xl: 32px;
+  --tb-font-size-display-sm: 42px;
+  --tb-font-size-4xl: 44px;
+
+  --tb-space-0-5: 2px;
+  --tb-space-1: 4px;
+  --tb-space-1-5: 6px;
+  --tb-space-2: 8px;
+  --tb-space-2-5: 10px;
+  --tb-space-3: 12px;
+  --tb-space-3-5: 14px;
+  --tb-space-4: 16px;
+  --tb-space-4-5: 18px;
+  --tb-space-5: 20px;
+  --tb-space-5-5: 22px;
+  --tb-space-6: 24px;
+  --tb-space-6-5: 26px;
+  --tb-space-7: 28px;
+  --tb-space-7-5: 30px;
+  --tb-space-8: 32px;
+  --tb-space-9: 36px;
+  --tb-space-10: 40px;
+  --tb-space-11: 44px;
+  --tb-space-12: 48px;
+  --tb-space-row: 50px;
+  --tb-space-footer: 68px;
+
+  --tb-radius-card: 8px;
+  --tb-radius-control: 4px;
+  --tb-radius-pill: 16px;
+  --tb-radius-nav: 6px;
+  --tb-shadow-selected: 0 1px 2px rgb(0 0 0 / 15%);
+  --tb-shadow-dialog: 0 14px 44px rgb(0 0 0 / 28%);
+  --tb-window-width: 1100px;
+  --tb-window-height: 720px;
+}
+
+html,
+body,
+#root {
+  min-width: 960px;
+  min-height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: var(--tb-color-canvas);
+  color: var(--tb-color-ink);
+  font-family: var(--tb-font-body);
+  font-size: var(--tb-font-size-base);
+}
+
+body {
+  min-height: 100vh;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  font-family: var(--tb-font-display);
+  letter-spacing: -0.6px;
+}

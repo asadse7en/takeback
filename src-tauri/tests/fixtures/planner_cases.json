@@ -1,0 +1,32 @@
+[
+  {
+    "source": "sample/IMG_0134.jpg",
+    "filename": "IMG_0134.jpg",
+    "album": "Paris trip",
+    "date": "2024-05-16",
+    "isPhoto": true,
+    "isVideo": false,
+    "isLive": false,
+    "favorite": true,
+    "archived": false,
+    "trashed": false,
+    "edited": false,
+    "hasJson": true,
+    "duplicateOf": null
+  },
+  {
+    "source": "sample/IMG_0135.mov",
+    "filename": "IMG_0135.mov",
+    "album": "Paris trip",
+    "date": "2024-05-16",
+    "isPhoto": false,
+    "isVideo": true,
+    "isLive": false,
+    "favorite": true,
+    "archived": false,
+    "trashed": false,
+    "edited": false,
+    "hasJson": true,
+    "duplicateOf": null
+  }
+]
