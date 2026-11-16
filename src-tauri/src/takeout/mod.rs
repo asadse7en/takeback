@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+use crate::archive::{
+    AddSourcesResult, ArchiveType, EntryType, IndexedEntry, SourceEntry, SourceRecord,
+};
 use flate2::read::GzDecoder;
-use rayon::prelude::*;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tar::Archive;
@@ -34,8 +36,21 @@ pub struct ScanWarning {
 }
 
 pub trait Source: Send + Sync {
-    fn list_entries(&self) -> Result<Vec<String>, String>;
-    fn stream_entry(&self, entry_name: &str) -> Result<Vec<u8>, String>;
+    fn visit_entries(
+        &self,
+        visitor: &mut dyn FnMut(&SourceEntry, &mut dyn Read) -> Result<(), String>,
+    ) -> Result<(), String>;
+
+    fn copy_entry_to(&self, entry_path: &str, output: &mut dyn Write) -> Result<u64, String>;
+
+    fn list_entries(&self) -> Result<Vec<SourceEntry>, String> {
+        let mut entries = Vec::new();
+        self.visit_entries(&mut |entry, _| {
+            entries.push(entry.clone());
+            Ok(())
+        })?;
+        Ok(entries)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -44,31 +59,44 @@ pub struct ZipSource {
 }
 
 impl Source for ZipSource {
-    fn list_entries(&self) -> Result<Vec<String>, String> {
-        let file = fs::File::open(&self.path).map_err(|e| format!("open zip {}: {e}", self.path.display()))?;
-        let mut archive = ZipArchive::new(file).map_err(|e| format!("read zip {}: {e}", self.path.display()))?;
+    fn visit_entries(
+        &self,
+        visitor: &mut dyn FnMut(&SourceEntry, &mut dyn Read) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let file = fs::File::open(&self.path)
+            .map_err(|e| format!("open zip {}: {e}", self.path.display()))?;
+        let mut archive =
+            ZipArchive::new(file).map_err(|e| format!("read zip {}: {e}", self.path.display()))?;
 
-        let mut names = Vec::new();
         for idx in 0..archive.len() {
-            let entry = archive.by_index(idx).map_err(|e| format!("read zip entry {}: {e}", self.path.display()))?;
-            let name = entry.name().trim_end_matches('/').to_string();
-            if !name.is_empty() && !entry.is_dir() {
-                names.push(name);
+            let mut entry = archive
+                .by_index(idx)
+                .map_err(|e| format!("read zip entry {}: {e}", self.path.display()))?;
+            if entry.is_dir() {
+                continue;
             }
+            let entry_path = entry.name().to_string();
+            let path = normalize_archive_entry_path(&entry_path)?;
+            let metadata = SourceEntry {
+                entry_path,
+                entry_type: entry_type_for_path(&path),
+                path,
+                size: entry.size(),
+            };
+            visitor(&metadata, &mut entry)?;
         }
-        Ok(names)
+        Ok(())
     }
 
-    fn stream_entry(&self, entry_name: &str) -> Result<Vec<u8>, String> {
-        let file = fs::File::open(&self.path).map_err(|e| format!("open zip {}: {e}", self.path.display()))?;
-        let mut archive = ZipArchive::new(file).map_err(|e| format!("read zip {}: {e}", self.path.display()))?;
-
+    fn copy_entry_to(&self, entry_path: &str, output: &mut dyn Write) -> Result<u64, String> {
+        let file = fs::File::open(&self.path)
+            .map_err(|e| format!("open zip {}: {e}", self.path.display()))?;
+        let mut archive =
+            ZipArchive::new(file).map_err(|e| format!("read zip {}: {e}", self.path.display()))?;
         let mut entry = archive
-            .by_name(entry_name)
-            .map_err(|_| format!("zip entry not found: {entry_name}"))?;
-        let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes).map_err(|e| format!("read zip entry {entry_name}: {e}"))?;
-        Ok(bytes)
+            .by_name(entry_path)
+            .map_err(|_| format!("zip entry not found: {entry_path}"))?;
+        io::copy(&mut entry, output).map_err(|e| format!("stream zip entry {entry_path}: {e}"))
     }
 }
 
@@ -78,43 +106,60 @@ pub struct TgzSource {
 }
 
 impl Source for TgzSource {
-    fn list_entries(&self) -> Result<Vec<String>, String> {
-        let file = fs::File::open(&self.path).map_err(|e| format!("open tgz {}: {e}", self.path.display()))?;
+    fn visit_entries(
+        &self,
+        visitor: &mut dyn FnMut(&SourceEntry, &mut dyn Read) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let file = fs::File::open(&self.path)
+            .map_err(|e| format!("open tgz {}: {e}", self.path.display()))?;
         let decoder = GzDecoder::new(file);
         let mut archive = Archive::new(decoder);
-        let mut names = Vec::new();
 
-        for entry in archive.entries().map_err(|e| format!("read tgz {}: {e}", self.path.display()))? {
-            let file = entry.map_err(|e| format!("read tgz entry {}: {e}", self.path.display()))?;
-            let path = file.path().map_err(|e| format!("tgz path {}: {e}", self.path.display()))?
-                .to_string_lossy()
-                .trim_end_matches('/')
-                .to_string();
-            if !path.is_empty() {
-                names.push(path);
+        for entry in archive
+            .entries()
+            .map_err(|e| format!("read tgz {}: {e}", self.path.display()))?
+        {
+            let mut file =
+                entry.map_err(|e| format!("read tgz entry {}: {e}", self.path.display()))?;
+            if !file.header().entry_type().is_file() {
+                continue;
             }
+            let entry_path = std::str::from_utf8(file.path_bytes().as_ref())
+                .map_err(|e| format!("tgz entry path is not valid UTF-8: {e}"))?
+                .to_string();
+            let path = normalize_archive_entry_path(&entry_path)?;
+            let metadata = SourceEntry {
+                entry_path,
+                entry_type: entry_type_for_path(&path),
+                path,
+                size: file.size(),
+            };
+            visitor(&metadata, &mut file)?;
         }
-        Ok(names)
+        Ok(())
     }
 
-    fn stream_entry(&self, entry_name: &str) -> Result<Vec<u8>, String> {
-        let file = fs::File::open(&self.path).map_err(|e| format!("open tgz {}: {e}", self.path.display()))?;
+    fn copy_entry_to(&self, entry_path: &str, output: &mut dyn Write) -> Result<u64, String> {
+        let file = fs::File::open(&self.path)
+            .map_err(|e| format!("open tgz {}: {e}", self.path.display()))?;
         let decoder = GzDecoder::new(file);
         let mut archive = Archive::new(decoder);
 
-        for entry in archive.entries().map_err(|e| format!("read tgz {}: {e}", self.path.display()))? {
-            let mut file = entry.map_err(|e| format!("read tgz entry {}: {e}", self.path.display()))?;
-            let name = file.path().map_err(|e| format!("tgz path {}: {e}", self.path.display()))?
-                .to_string_lossy()
-                .to_string();
-            if name == entry_name {
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)
-                    .map_err(|e| format!("read tgz entry {entry_name}: {e}"))?;
-                return Ok(bytes);
+        for entry in archive
+            .entries()
+            .map_err(|e| format!("read tgz {}: {e}", self.path.display()))?
+        {
+            let mut file =
+                entry.map_err(|e| format!("read tgz entry {}: {e}", self.path.display()))?;
+            let path_bytes = file.path_bytes();
+            let name = std::str::from_utf8(path_bytes.as_ref())
+                .map_err(|e| format!("tgz entry path is not valid UTF-8: {e}"))?;
+            if name == entry_path {
+                return io::copy(&mut file, output)
+                    .map_err(|e| format!("stream tgz entry {entry_path}: {e}"));
             }
         }
-        Err(format!("tgz entry not found: {entry_name}"))
+        Err(format!("tgz entry not found: {entry_path}"))
     }
 }
 
@@ -124,105 +169,594 @@ pub struct FolderSource {
 }
 
 impl Source for FolderSource {
-    fn list_entries(&self) -> Result<Vec<String>, String> {
-        let mut names = Vec::new();
-        for entry in WalkDir::new(&self.root).into_iter().filter_map(Result::ok) {
+    fn visit_entries(
+        &self,
+        visitor: &mut dyn FnMut(&SourceEntry, &mut dyn Read) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for entry in WalkDir::new(&self.root).into_iter() {
+            let entry = entry.map_err(|e| format!("read folder {}: {e}", self.root.display()))?;
             let path = entry.path();
-            if path.is_file() {
-                let rel = path
-                    .strip_prefix(&self.root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                if !rel.is_empty() {
-                    names.push(rel);
-                }
+            if !entry.file_type().is_file() {
+                continue;
             }
+            let relative = path
+                .strip_prefix(&self.root)
+                .map_err(|e| format!("resolve folder entry {}: {e}", path.display()))?;
+            let entry_path = relative
+                .to_str()
+                .ok_or_else(|| {
+                    format!("folder entry path is not valid Unicode: {}", path.display())
+                })?
+                .replace('\\', "/");
+            let normalized = normalize_archive_entry_path(&entry_path)?;
+            let metadata = fs::metadata(path)
+                .map_err(|e| format!("read file metadata {}: {e}", path.display()))?;
+            let source_entry = SourceEntry {
+                entry_path,
+                entry_type: entry_type_for_path(&normalized),
+                path: normalized,
+                size: metadata.len(),
+            };
+            let mut file =
+                fs::File::open(path).map_err(|e| format!("open file {}: {e}", path.display()))?;
+            visitor(&source_entry, &mut file)?;
         }
-        Ok(names)
+        Ok(())
     }
 
-    fn stream_entry(&self, entry_name: &str) -> Result<Vec<u8>, String> {
-        let path = self.root.join(entry_name.replace('/', "/"));
-        let mut file = fs::File::open(&path).map_err(|e| format!("open file {}: {e}", path.display()))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|e| format!("read file {}: {e}", path.display()))?;
-        Ok(bytes)
+    fn copy_entry_to(&self, entry_path: &str, output: &mut dyn Write) -> Result<u64, String> {
+        let normalized = normalize_archive_entry_path(entry_path)?;
+        let path = normalized
+            .split('/')
+            .fold(self.root.clone(), |current, part| current.join(part));
+        let mut file =
+            fs::File::open(&path).map_err(|e| format!("open file {}: {e}", path.display()))?;
+        io::copy(&mut file, output).map_err(|e| format!("stream file {}: {e}", path.display()))
     }
 }
 
 #[derive(Debug)]
 pub struct TempIndex {
     conn: Connection,
+    _temp_dir: tempfile::TempDir,
 }
 
 impl TempIndex {
     pub fn new() -> Result<Self, String> {
-        let conn = Connection::open_in_memory().map_err(|e| format!("open temp sqlite index: {e}"))?;
+        let temp_dir =
+            tempfile::tempdir().map_err(|e| format!("create temp index directory: {e}"))?;
+        let db_path = temp_dir.path().join("takeback-index.sqlite");
+        let conn = Connection::open(&db_path)
+            .map_err(|e| format!("open temp sqlite index {}: {e}", db_path.display()))?;
+        conn.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;")
+            .map_err(|e| format!("configure temp sqlite index: {e}"))?;
         conn.execute(
-            "CREATE TABLE media (path TEXT PRIMARY KEY, kind TEXT, size INTEGER)",
+            "CREATE TABLE entries (
+                archive_path TEXT NOT NULL,
+                path TEXT NOT NULL,
+                entry_path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                album TEXT,
+                trashed INTEGER NOT NULL,
+                archived INTEGER NOT NULL,
+                metadata_json TEXT,
+                sidecar_archive_path TEXT,
+                sidecar_path TEXT,
+                sidecar_match TEXT,
+                PRIMARY KEY (archive_path, path)
+            )",
             (),
         )
-        .map_err(|e| format!("create media table: {e}"))?;
-        conn.execute(
-            "CREATE TABLE sidecars (path TEXT PRIMARY KEY, media_path TEXT, kind TEXT)",
-            (),
-        )
-        .map_err(|e| format!("create sidecars table: {e}"))?;
-        conn.execute(
-            "CREATE TABLE album_membership (album TEXT, media_path TEXT)",
-            (),
-        )
-        .map_err(|e| format!("create album-membership table: {e}"))?;
-        Ok(Self { conn })
+        .map_err(|e| format!("create archive index table: {e}"))?;
+        Ok(Self {
+            conn,
+            _temp_dir: temp_dir,
+        })
     }
 
-    pub fn add_media(&self, path: &str, kind: &str, size: u64) -> Result<(), String> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO media (path, kind, size) VALUES (?1, ?2, ?3)",
-            (path, kind, size as i64),
-        )
-        .map_err(|e| format!("insert media {path}: {e}"))?;
+    fn add_entry(
+        &self,
+        archive_path: &str,
+        entry: &SourceEntry,
+        album: Option<&str>,
+        trashed: bool,
+        archived: bool,
+        metadata: Option<&crate::metadata::TakeoutMetadata>,
+    ) -> Result<(), String> {
+        let size = i64::try_from(entry.size)
+            .map_err(|_| format!("entry is too large to index: {}", entry.path))?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO entries (
+                archive_path, path, entry_path, size, kind, album, trashed, archived, metadata_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (
+                    archive_path,
+                    &entry.path,
+                    &entry.entry_path,
+                    size,
+                    entry_type_name(entry.entry_type),
+                    album,
+                    trashed,
+                    archived,
+                    metadata
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(|error| {
+                            format!("serialize JSON sidecar {}: {error}", entry.path)
+                        })?,
+                ),
+            )
+            .map_err(|e| format!("index entry {}: {e}", entry.path))?;
         Ok(())
     }
 
-    pub fn add_sidecar(&self, path: &str, media_path: &str, kind: &str) -> Result<(), String> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO sidecars (path, media_path, kind) VALUES (?1, ?2, ?3)",
-            (path, media_path, kind),
-        )
-        .map_err(|e| format!("insert sidecar {path}: {e}"))?;
+    fn set_sidecar(
+        &self,
+        archive_path: &str,
+        path: &str,
+        sidecar_archive_path: &str,
+        sidecar_path: &str,
+        match_reason: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE entries
+             SET sidecar_archive_path = ?1, sidecar_path = ?2, sidecar_match = ?3
+             WHERE archive_path = ?4 AND path = ?5",
+                (
+                    sidecar_archive_path,
+                    sidecar_path,
+                    match_reason,
+                    archive_path,
+                    path,
+                ),
+            )
+            .map_err(|e| format!("pair JSON sidecar with {}: {e}", path))?;
         Ok(())
     }
 
-    pub fn add_album_membership(&self, album: &str, media_path: &str) -> Result<(), String> {
-        self.conn.execute(
-            "INSERT INTO album_membership (album, media_path) VALUES (?1, ?2)",
-            (album, media_path),
-        )
-        .map_err(|e| format!("insert album membership {album}: {e}"))?;
-        Ok(())
+    pub fn entries(&self) -> Result<Vec<IndexedEntry>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT entry.archive_path, entry.path, entry.size, entry.kind, entry.album,
+                        entry.trashed, entry.archived, entry.sidecar_archive_path,
+                        entry.sidecar_path, entry.sidecar_match, sidecar.metadata_json
+                 FROM entries AS entry
+                 LEFT JOIN entries AS sidecar
+                   ON sidecar.archive_path = entry.sidecar_archive_path
+                  AND sidecar.path = entry.sidecar_path
+                 ORDER BY entry.archive_path, entry.path",
+            )
+            .map_err(|e| format!("prepare archive index read: {e}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                let kind: String = row.get(3)?;
+                let size: i64 = row.get(2)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    size,
+                    kind,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, bool>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            })
+            .map_err(|e| format!("query archive index: {e}"))?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (
+                archive_path,
+                path,
+                size,
+                kind,
+                album,
+                trashed,
+                archived,
+                sidecar_archive_path,
+                sidecar_path,
+                sidecar_match,
+                metadata_json,
+            ) = row.map_err(|e| format!("read archive index entry: {e}"))?;
+            let entry_type = parse_entry_type(&kind)?;
+            let size = u64::try_from(size).map_err(|e| format!("invalid indexed size: {e}"))?;
+            let metadata: Option<crate::metadata::TakeoutMetadata> = metadata_json
+                .map(|json| {
+                    serde_json::from_str(&json)
+                        .map_err(|error| format!("read indexed sidecar metadata: {error}"))
+                })
+                .transpose()?;
+            entries.push(IndexedEntry {
+                archive_path,
+                path,
+                size,
+                entry_type,
+                album,
+                trashed: trashed || metadata.as_ref().is_some_and(|fields| fields.trashed),
+                archived: archived || metadata.as_ref().is_some_and(|fields| fields.archived),
+                sidecar_archive_path,
+                sidecar_path,
+                sidecar_match,
+                metadata,
+            });
+        }
+        Ok(entries)
     }
 
     pub fn counts(&self) -> Result<Counts, String> {
-        let stats: (u32, u32, u32, f64) = self
+        let stats: (u32, u32, f64) = self
             .conn
             .query_row(
-                "SELECT COALESCE(SUM(CASE WHEN kind='photo' THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN kind='video' THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN kind='live' THEN 1 ELSE 0 END),0), COALESCE(SUM(size),0) / 1024.0 / 1024.0 / 1024.0 FROM media",
+                "SELECT
+                    COALESCE(SUM(CASE WHEN kind='photo' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN kind='video' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN kind IN ('photo', 'video') THEN size ELSE 0 END), 0)
+                        / 1024.0 / 1024.0 / 1024.0
+                 FROM entries",
                 (),
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .map_err(|e| format!("count media rows: {e}"))?;
-        Ok(Counts { photos: stats.0, videos: stats.1, live: stats.2, total_gb: stats.3 })
+            .map_err(|e| format!("count indexed entries: {e}"))?;
+        Ok(Counts {
+            photos: stats.0,
+            videos: stats.1,
+            live: 0,
+            total_gb: stats.2,
+        })
+    }
+
+    fn google_photos_root(&self) -> Result<Option<String>, String> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT path FROM entries")
+            .map_err(|e| format!("prepare archive-root lookup: {e}"))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("query archive paths: {e}"))?;
+        let mut counts = HashMap::<String, usize>::new();
+        for row in rows {
+            let path = row.map_err(|e| format!("read archive path: {e}"))?;
+            for component in Path::new(&path).components() {
+                if let Component::Normal(part) = component {
+                    let name = part.to_string_lossy();
+                    if ["Google Photos", "Google Fotos", "Google フォト"]
+                        .iter()
+                        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+                    {
+                        *counts.entry(name.to_string()).or_default() += 1;
+                    }
+                }
+            }
+        }
+        Ok(counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(name, _)| name))
     }
 }
 
+pub fn index_sources(paths: &[String]) -> Result<TempIndex, String> {
+    let expanded_paths = expand_source_paths(paths)?;
+    index_expanded_sources(&expanded_paths)
+}
+
+fn index_expanded_sources(paths: &[String]) -> Result<TempIndex, String> {
+    let index = TempIndex::new()?;
+    let mut media_refs = Vec::new();
+    let mut media_paths = Vec::new();
+    let mut sidecars = Vec::new();
+
+    for path in paths.iter().filter(|path| !path.trim().is_empty()) {
+        let source_path = Path::new(path);
+        let source = create_source(source_path)?;
+        let archive_path = source_path.to_string_lossy().to_string();
+        source.visit_entries(&mut |entry, reader| {
+            let metadata = if entry.entry_type == EntryType::JsonSidecar {
+                Some(crate::metadata::TakeoutMetadata::from_reader(reader)?)
+            } else {
+                None
+            };
+            let (album, trashed, archived) = classify_entry_path(&entry.path);
+            index.add_entry(
+                &archive_path,
+                entry,
+                album.as_deref(),
+                trashed,
+                archived,
+                metadata.as_ref(),
+            )?;
+            match entry.entry_type {
+                EntryType::Photo | EntryType::Video => {
+                    media_refs.push((archive_path.clone(), entry.path.clone()));
+                    media_paths.push(entry.path.clone());
+                }
+                EntryType::JsonSidecar => {
+                    sidecars.push(matcher::SidecarCandidate {
+                        archive_path: archive_path.clone(),
+                        path: entry.path.clone(),
+                        title: metadata.and_then(|fields| fields.title),
+                    });
+                }
+                EntryType::Other => {}
+            }
+            Ok(())
+        })?;
+    }
+
+    let matches = matcher::match_sidecars(&media_paths, &sidecars);
+    for ((archive_path, media_path), matched) in media_refs.iter().zip(matches) {
+        if let Some(matched) = matched {
+            index.set_sidecar(
+                archive_path,
+                media_path,
+                &matched.archive_path,
+                &matched.path,
+                &format!("{:?}", matched.reason),
+            )?;
+        }
+    }
+
+    Ok(index)
+}
+
+fn classify_entry_path(path: &str) -> (Option<String>, bool, bool) {
+    let normalized = path.replace('\\', "/");
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let trashed = parts.iter().any(|part| part.eq_ignore_ascii_case("trash"));
+    let archived = parts
+        .iter()
+        .any(|part| part.eq_ignore_ascii_case("archive"));
+    let album = matcher::album_membership(path).into_iter().next();
+    (album, trashed, archived)
+}
+
+fn entry_type_for_path(path: &str) -> EntryType {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    if extension == "json" {
+        EntryType::JsonSidecar
+    } else if matches!(
+        extension.as_str(),
+        "jpg"
+            | "jpeg"
+            | "png"
+            | "heic"
+            | "heif"
+            | "webp"
+            | "tif"
+            | "tiff"
+            | "dng"
+            | "cr2"
+            | "nef"
+            | "arw"
+            | "orf"
+            | "rw2"
+    ) {
+        EntryType::Photo
+    } else if matches!(
+        extension.as_str(),
+        "mp4" | "mov" | "m4v" | "avi" | "mkv" | "3gp" | "mts" | "m2ts"
+    ) {
+        EntryType::Video
+    } else {
+        EntryType::Other
+    }
+}
+
+fn entry_type_name(entry_type: EntryType) -> &'static str {
+    match entry_type {
+        EntryType::Photo => "photo",
+        EntryType::Video => "video",
+        EntryType::JsonSidecar => "jsonSidecar",
+        EntryType::Other => "other",
+    }
+}
+
+fn parse_entry_type(value: &str) -> Result<EntryType, String> {
+    match value {
+        "photo" => Ok(EntryType::Photo),
+        "video" => Ok(EntryType::Video),
+        "jsonSidecar" => Ok(EntryType::JsonSidecar),
+        "other" => Ok(EntryType::Other),
+        _ => Err(format!("unknown archive entry type: {value}")),
+    }
+}
+
+fn normalize_archive_entry_path(entry_path: &str) -> Result<String, String> {
+    let normalized = entry_path.replace('\\', "/");
+    let mut components = normalized.split('/');
+    let first = components.next().unwrap_or_default();
+    if normalized.starts_with('/')
+        || first.ends_with(':')
+        || normalized.split('/').any(|component| component == "..")
+    {
+        return Err(format!("unsafe path in Takeout source: {entry_path}"));
+    }
+
+    let path = normalized
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    if path.is_empty() {
+        return Err("empty path in Takeout source".to_string());
+    }
+    Ok(path)
+}
+
+fn archive_type_for_path(path: &Path) -> Result<ArchiveType, String> {
+    if path.is_dir() {
+        return Ok(ArchiveType::Folder);
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("source path is not valid Unicode: {}", path.display()))?
+        .to_lowercase();
+    if file_name.ends_with(".zip") {
+        Ok(ArchiveType::Zip)
+    } else if file_name.ends_with(".tgz") || file_name.ends_with(".tar.gz") {
+        Ok(ArchiveType::Tgz)
+    } else {
+        Err(format!("unsupported Takeout source: {}", path.display()))
+    }
+}
+
+fn numbered_part(path: &Path) -> Option<(String, u32)> {
+    let file_name = path.file_name()?.to_str()?.to_lowercase();
+    let stem = file_name.strip_suffix(".zip")?;
+    let (prefix, number) = stem.rsplit_once('-')?;
+    if number.len() < 3 || !number.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    let number = number.parse().ok()?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let key = format!(
+        "{}|{prefix}.zip",
+        parent.to_string_lossy().replace('\\', "/").to_lowercase()
+    );
+    Some((key, number))
+}
+
+fn push_source_path(
+    path: String,
+    seen: &mut std::collections::HashSet<String>,
+    expanded: &mut Vec<String>,
+) {
+    let key = path.replace('\\', "/").to_lowercase();
+    if seen.insert(key) {
+        expanded.push(path);
+    }
+}
+
+fn expand_source_paths(paths: &[String]) -> Result<Vec<String>, String> {
+    let mut expanded = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for path in paths.iter().filter(|path| !path.trim().is_empty()) {
+        let selected = Path::new(path);
+        let Some((group_key, _)) = numbered_part(selected) else {
+            push_source_path(path.clone(), &mut seen, &mut expanded);
+            continue;
+        };
+        let parent = selected
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let entries = fs::read_dir(parent).map_err(|error| {
+            format!(
+                "find Takeout archive parts in {}: {error}",
+                parent.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!("read Takeout archive list in {}: {error}", parent.display())
+            })?;
+            if !entry
+                .file_type()
+                .map_err(|error| {
+                    format!(
+                        "read Takeout archive part metadata in {}: {error}",
+                        parent.display()
+                    )
+                })?
+                .is_file()
+            {
+                continue;
+            }
+            let candidate_path = entry.path();
+            if numbered_part(&candidate_path)
+                .is_some_and(|(candidate_group, _)| candidate_group == group_key)
+            {
+                push_source_path(
+                    candidate_path.to_string_lossy().to_string(),
+                    &mut seen,
+                    &mut expanded,
+                );
+            }
+        }
+        push_source_path(path.clone(), &mut seen, &mut expanded);
+    }
+
+    expanded.sort_by_key(|path| path.to_lowercase());
+    Ok(expanded)
+}
+
+pub fn inspect_sources(paths: &[String]) -> Result<AddSourcesResult, String> {
+    let mut result = AddSourcesResult::default();
+    let mut part_names = Vec::new();
+
+    for source_path in expand_source_paths(paths)? {
+        let path = Path::new(&source_path);
+        let archive_type = archive_type_for_path(path)?;
+        let source = create_source(path)?;
+        let mut entry_count = 0u64;
+        let mut folder_size = 0u64;
+        source.visit_entries(&mut |entry, _| {
+            entry_count += 1;
+            if archive_type == ArchiveType::Folder {
+                folder_size = folder_size
+                    .checked_add(entry.size)
+                    .ok_or_else(|| "folder size is too large to calculate".to_string())?;
+            }
+            Ok(())
+        })?;
+        let size_bytes = if archive_type == ArchiveType::Folder {
+            folder_size
+        } else {
+            fs::metadata(path)
+                .map_err(|error| format!("read source metadata {}: {error}", path.display()))?
+                .len()
+        };
+        result.archives.push(SourceRecord {
+            id: path.to_string_lossy().to_string(),
+            path: path.to_string_lossy().to_string(),
+            archive_type,
+            size_bytes,
+            entry_count,
+        });
+        part_names.push(source_path);
+    }
+
+    for missing in detect_numbering_gap_from_names(&part_names) {
+        result
+            .warnings
+            .push(format!("Missing Takeout archive part {missing:03}."));
+    }
+    Ok(result)
+}
+
 pub fn detect_numbering_gaps(numbers: &[u32]) -> Vec<u32> {
-    let mut set = numbers.iter().copied().collect::<std::collections::HashSet<_>>();
+    if numbers.is_empty() {
+        return Vec::new();
+    }
+    let set = numbers
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
     let start = numbers.iter().copied().min().unwrap_or(0);
     let end = numbers.iter().copied().max().unwrap_or(0);
     let mut missing = Vec::new();
+    if start > 1 {
+        missing.extend(1..start);
+    }
     for n in start..=end {
         if !set.contains(&n) {
             missing.push(n);
@@ -232,24 +766,72 @@ pub fn detect_numbering_gaps(numbers: &[u32]) -> Vec<u32> {
 }
 
 pub fn detect_numbering_gap_from_names(names: &[String]) -> Vec<u32> {
-    let mut numbers = Vec::new();
+    let mut groups: HashMap<String, Vec<u32>> = HashMap::new();
     for name in names {
-        let mut candidate = None;
-        let cleaned = name.rsplit('/').next().unwrap_or(name).to_string();
-        for part in cleaned.split(|c: char| !c.is_ascii_digit()) {
-            if part.is_empty() {
-                continue;
+        let file_name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+        let lower = file_name.to_lowercase();
+        let Some(stem) = lower.strip_suffix(".zip") else {
+            continue;
+        };
+        let Some((group, number)) = stem.rsplit_once('-') else {
+            continue;
+        };
+        if number.len() >= 3 && number.chars().all(|character| character.is_ascii_digit()) {
+            if let Ok(number) = number.parse::<u32>() {
+                groups.entry(group.to_string()).or_default().push(number);
             }
-            if let Ok(v) = part.parse::<u32>() {
-                candidate = Some(v);
-            }
-        }
-        if let Some(number) = candidate {
-            numbers.push(number);
         }
     }
-    detect_numbering_gaps(&numbers)
+    let mut missing = Vec::new();
+    for numbers in groups.values() {
+        missing.extend(detect_numbering_gaps(numbers));
+    }
+    missing.sort_unstable();
+    missing.dedup();
+    missing
 }
+
+pub fn scan_paths(paths: &[String]) -> Result<ScanSourcesResult, String> {
+    let expanded_paths = expand_source_paths(paths)?;
+    let index = index_expanded_sources(&expanded_paths)?;
+    let counts = index.counts()?;
+    let mut warnings: Vec<String> = detect_numbering_gap_from_names(&expanded_paths)
+        .into_iter()
+        .map(|part| format!("Missing Takeout archive part {part:03}."))
+        .collect();
+    if let Some(root) = index.google_photos_root()? {
+        warnings.push(format!("Detected Google Photos folder: {root}"));
+    }
+    Ok(ScanSourcesResult {
+        files: expanded_paths,
+        counts,
+        warnings,
+    })
+}
+
+pub fn create_source(path: &Path) -> Result<Box<dyn Source>, String> {
+    if path.is_dir() {
+        return Ok(Box::new(FolderSource {
+            root: path.to_path_buf(),
+        }));
+    }
+    if !path.is_file() {
+        return Err(format!("Takeout source does not exist: {}", path.display()));
+    }
+    match archive_type_for_path(path)? {
+        ArchiveType::Zip => Ok(Box::new(ZipSource {
+            path: path.to_path_buf(),
+        })),
+        ArchiveType::Tgz => Ok(Box::new(TgzSource {
+            path: path.to_path_buf(),
+        })),
+        ArchiveType::Folder => Ok(Box::new(FolderSource {
+            root: path.to_path_buf(),
+        })),
+    }
+}
+
+pub mod matcher;
 
 pub fn detect_google_photos_root(entries: &[String]) -> Option<String> {
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -275,103 +857,6 @@ pub fn detect_google_photos_root(entries: &[String]) -> Option<String> {
         .map(|(name, _)| name)
 }
 
-pub fn create_source(path: &Path) -> Result<Box<dyn Source>, String> {
-    let path_str = path.to_string_lossy().to_ascii_lowercase();
-    if path_str.ends_with(".zip") {
-        Ok(Box::new(ZipSource { path: path.to_path_buf() }))
-    } else if path_str.ends_with(".tgz") || path_str.ends_with(".tar.gz") {
-        Ok(Box::new(TgzSource { path: path.to_path_buf() }))
-    } else if path.is_dir() {
-        Ok(Box::new(FolderSource { root: path.to_path_buf() }))
-    } else {
-        Err(format!("unsupported Takeout source: {}", path.display()))
-    }
-}
-
-pub fn scan_paths(paths: &[String]) -> Result<ScanSourcesResult, String> {
-    if paths.is_empty() {
-        return Ok(ScanSourcesResult {
-            files: Vec::new(),
-            counts: Counts { photos: 0, videos: 0, live: 0, total_gb: 0.0 },
-            warnings: Vec::new(),
-        });
-    }
-
-    let flattened: Vec<String> = paths
-        .iter()
-        .filter(|path| !path.trim().is_empty())
-        .cloned()
-        .collect();
-
-    let discovered: Vec<ScanSourcesResult> = flattened
-        .par_iter()
-        .map(|path| {
-            let source = create_source(Path::new(path)).map_err(|e| e.to_string())?;
-            let entries = source.list_entries().map_err(|e| e.to_string())?;
-            let mut index = TempIndex::new().map_err(|e| e.to_string())?;
-            for entry in entries {
-                let normalized = entry.replace('\\', "/");
-                let lower = normalized.to_ascii_lowercase();
-                let kind = if lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".png") || lower.ends_with(".heic") || lower.ends_with(".webp") {
-                    "photo"
-                } else if lower.ends_with(".mp4") || lower.ends_with(".mov") || lower.ends_with(".m4v") {
-                    "video"
-                } else {
-                    "other"
-                };
-                if kind != "other" {
-                    let size = source.stream_entry(&normalized).map_err(|e| e.to_string())?.len() as u64;
-                    index.add_media(&normalized, kind, size).map_err(|e| e.to_string())?;
-                }
-                if lower.ends_with(".json") {
-                    index.add_sidecar(&normalized, &normalized, "json").map_err(|e| e.to_string())?;
-                }
-                if normalized.contains("album") {
-                    index.add_album_membership("album", &normalized).map_err(|e| e.to_string())?;
-                }
-            }
-            let counts = index.counts().map_err(|e| e.to_string())?;
-            Ok(ScanSourcesResult {
-                files: vec![path.clone()],
-                counts,
-                warnings: Vec::new(),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    let mut files = flattened.clone();
-    let mut counts = Counts { photos: 0, videos: 0, live: 0, total_gb: 0.0 };
-    let mut warnings = Vec::new();
-    for result in discovered {
-        counts.photos += result.counts.photos;
-        counts.videos += result.counts.videos;
-        counts.live += result.counts.live;
-        counts.total_gb += result.counts.total_gb;
-        warnings.extend(result.warnings);
-    }
-
-    let numbering = detect_numbering_gap_from_names(&files);
-    if !numbering.is_empty() {
-        warnings.push(format!("Numbering gap detected in part files: {:?}", numbering));
-    }
-
-    if let Some(root) = detect_google_photos_root(&files) {
-        warnings.push(format!("Detected Google Photos folder: {root}"));
-    }
-
-    Ok(ScanSourcesResult {
-        files,
-        counts,
-        warnings,
-    })
-}
-
-pub mod matcher;
-
-pub fn scan_sources() -> Vec<String> {
-    vec!["takeout-2024.zip".to_string()]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,10 +864,11 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
-    fn create_zip(path: &Path, name: &str, entries: &[(&str, &[u8])]) {
+    fn create_zip(path: &Path, entries: &[(&str, &[u8])]) {
         let file = fs::File::create(path).unwrap();
         let mut archive = zip::ZipWriter::new(file);
-        let options = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         for (entry_name, data) in entries {
             archive.start_file(*entry_name, options).unwrap();
             archive.write_all(data).unwrap();
@@ -397,13 +883,15 @@ mod tests {
         for (entry_name, data) in entries {
             let mut header = tar::Header::new_gnu();
             header.set_size(data.len() as u64);
-            archive.append_data(&mut header, *entry_name, *data).unwrap();
+            archive
+                .append_data(&mut header, *entry_name, *data)
+                .unwrap();
         }
         archive.finish().unwrap();
     }
 
     #[test]
-    fn source_implementations_list_and_stream_entries() {
+    fn zip_tgz_and_folder_sources_stream_entries() {
         let dir = tempdir().unwrap();
         let zip_path = dir.path().join("part-001.zip");
         let tgz_path = dir.path().join("part-002.tgz");
@@ -413,23 +901,66 @@ mod tests {
         let zip_data = b"zip-test";
         let tgz_data = b"tgz-test";
         fs::write(folder.join("media.jpg"), b"jpg").unwrap();
-        fs::write(folder.join("sidecar.json"), b"{}") .unwrap();
+        fs::write(folder.join("sidecar.json"), b"{}").unwrap();
 
-        create_zip(&zip_path, "test", &[("Takeout/Google Fotos/Photos from 2024/media.jpg", zip_data)]);
-        create_tgz(&tgz_path, &[("Takeout/Google Fotos/Photos from 2024/sidecar.json", tgz_data)]);
+        create_zip(
+            &zip_path,
+            &[("Takeout/Google Fotos/Photos from 2024/media.jpg", zip_data)],
+        );
+        create_tgz(
+            &tgz_path,
+            &[(
+                "Takeout/Google Fotos/Photos from 2024/sidecar.json",
+                tgz_data,
+            )],
+        );
 
-        let zip_source = ZipSource { path: zip_path.clone() };
-        assert!(zip_source.list_entries().unwrap().contains(&"Takeout/Google Fotos/Photos from 2024/media.jpg".to_string()));
-        assert_eq!(zip_source.stream_entry("Takeout/Google Fotos/Photos from 2024/media.jpg").unwrap(), zip_data);
+        let zip_source = ZipSource {
+            path: zip_path.clone(),
+        };
+        assert!(zip_source
+            .list_entries()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.path.ends_with("media.jpg")));
+        let mut zip_bytes = Vec::new();
+        zip_source
+            .copy_entry_to(
+                "Takeout/Google Fotos/Photos from 2024/media.jpg",
+                &mut zip_bytes,
+            )
+            .unwrap();
+        assert_eq!(zip_bytes, zip_data);
 
-        let tgz_source = TgzSource { path: tgz_path.clone() };
-        assert!(tgz_source.list_entries().unwrap().contains(&"Takeout/Google Fotos/Photos from 2024/sidecar.json".to_string()));
-        assert_eq!(tgz_source.stream_entry("Takeout/Google Fotos/Photos from 2024/sidecar.json").unwrap(), tgz_data);
+        let tgz_source = TgzSource {
+            path: tgz_path.clone(),
+        };
+        assert!(tgz_source
+            .list_entries()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.path.ends_with("sidecar.json")));
+        let mut tgz_bytes = Vec::new();
+        tgz_source
+            .copy_entry_to(
+                "Takeout/Google Fotos/Photos from 2024/sidecar.json",
+                &mut tgz_bytes,
+            )
+            .unwrap();
+        assert_eq!(tgz_bytes, tgz_data);
 
-        let folder_source = FolderSource { root: folder.clone() };
+        let folder_source = FolderSource {
+            root: folder.clone(),
+        };
         let entries = folder_source.list_entries().unwrap();
-        assert!(entries.iter().any(|entry| entry.ends_with("media.jpg")));
-        assert_eq!(folder_source.stream_entry("media.jpg").unwrap(), b"jpg");
+        assert!(entries
+            .iter()
+            .any(|entry| entry.path.ends_with("media.jpg")));
+        let mut folder_bytes = Vec::new();
+        folder_source
+            .copy_entry_to("media.jpg", &mut folder_bytes)
+            .unwrap();
+        assert_eq!(folder_bytes, b"jpg");
     }
 
     #[test]
@@ -441,6 +972,224 @@ mod tests {
         ];
         let gaps = detect_numbering_gap_from_names(&files);
         assert!(gaps.contains(&2));
-        assert_eq!(detect_google_photos_root(&files).as_deref(), Some("Google Fotos"));
+        assert_eq!(
+            detect_google_photos_root(&files).as_deref(),
+            Some("Google Fotos")
+        );
+    }
+
+    #[test]
+    fn add_sources_reports_archive_sizes_entry_counts_and_part_gaps() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("takeout-20240612T101500Z-001.zip");
+        let second = dir.path().join("takeout-20240612T101500Z-002.zip");
+        let fourth = dir.path().join("takeout-20240612T101500Z-004.zip");
+        create_zip(&first, &[("one.jpg", b"photo"), ("readme.txt", b"readme")]);
+        create_zip(&second, &[("two.mp4", b"video")]);
+        create_zip(&fourth, &[("three.json", b"{}")]);
+
+        let result = inspect_sources(&[first.to_string_lossy().to_string()]).unwrap();
+
+        assert_eq!(result.archives.len(), 3);
+        assert_eq!(result.archives[0].archive_type, ArchiveType::Zip);
+        assert_eq!(
+            result.archives[0].size_bytes,
+            fs::metadata(&first).unwrap().len()
+        );
+        assert_eq!(result.archives[0].entry_count, 2);
+        assert_eq!(result.archives[1].entry_count, 1);
+        assert_eq!(result.warnings, vec!["Missing Takeout archive part 003."]);
+    }
+
+    #[test]
+    fn index_pairs_json_across_parts_and_classifies_takeout_paths() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("takeout-20240612T101500Z-001.zip");
+        let second = dir.path().join("takeout-20240612T101500Z-002.zip");
+        let long_stem = format!("IMG_{}", "a".repeat(52));
+        let truncated = long_stem.chars().take(46).collect::<String>();
+        let media_entries = vec![
+            (
+                format!("Takeout/Google Fotos/Photos from 2024/{long_stem}.jpg"),
+                b"photo".as_slice(),
+            ),
+            (
+                "Takeout/Google Fotos/Album Ñ/猫.jpg".to_string(),
+                b"cat".as_slice(),
+            ),
+            (
+                "Takeout/Google Fotos/Archive/old.jpg".to_string(),
+                b"old".as_slice(),
+            ),
+            (
+                "Takeout/Google Fotos/Trash/deleted.jpg".to_string(),
+                b"trash".as_slice(),
+            ),
+            (
+                "Takeout/Google Fotos/Photos from 2023/PXL_1.jpg".to_string(),
+                b"legacy".as_slice(),
+            ),
+            (
+                "Takeout/Google Fotos/Photos from 2023/IMG_3(1).jpg".to_string(),
+                b"duplicate".as_slice(),
+            ),
+            (
+                "Takeout/Google Fotos/Photos from 2023/IMG_4-edited.jpg".to_string(),
+                b"edited".as_slice(),
+            ),
+        ];
+        let media_refs: Vec<(&str, &[u8])> = media_entries
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), *bytes))
+            .collect();
+        create_zip(&first, &media_refs);
+
+        let sidecars = vec![
+            (
+                format!("Takeout/Google Fotos/Photos from 2024/{truncated}.json"),
+                br#"{"title":"long"}"#.as_slice(),
+            ),
+            (
+                "Takeout/Google Fotos/Album Ñ/猫.jpg.supplemental-metadata.json".to_string(),
+                br#"{
+                    "title":"cat",
+                    "description":"A Takeout caption",
+                    "photoTakenTime":{"timestamp":"1700000000"},
+                    "geoData":{"latitude":0,"longitude":0},
+                    "geoDataExif":{"latitude":47.6,"longitude":-122.3,"altitude":12.5},
+                    "people":[{"name":"Ada"}],
+                    "favorited":true,
+                    "archived":true,
+                    "trashed":false,
+                    "url":"https://photos.example/cat"
+                }"#
+                .as_slice(),
+            ),
+            (
+                "Takeout/Google Fotos/Archive/old.jpg.json".to_string(),
+                br#"{"title":"old"}"#.as_slice(),
+            ),
+            (
+                "Takeout/Google Fotos/Trash/deleted.jpg.json".to_string(),
+                br#"{"title":"deleted"}"#.as_slice(),
+            ),
+            (
+                "Takeout/Google Fotos/Photos from 2023/PXL_1.json".to_string(),
+                br#"{"title":"PXL 1"}"#.as_slice(),
+            ),
+            (
+                "Takeout/Google Fotos/Photos from 2023/IMG_3.jpg(1).json".to_string(),
+                br#"{"title":"IMG 3"}"#.as_slice(),
+            ),
+            (
+                "Takeout/Google Fotos/Photos from 2023/IMG_4.jpg.json".to_string(),
+                br#"{"title":"IMG 4"}"#.as_slice(),
+            ),
+        ];
+        let sidecar_refs: Vec<(&str, &[u8])> = sidecars
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), *bytes))
+            .collect();
+        create_zip(&second, &sidecar_refs);
+
+        let index = index_sources(&[
+            first.to_string_lossy().to_string(),
+            second.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+        let entries = index.entries().unwrap();
+        let media: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.entry_type == EntryType::Photo)
+            .collect();
+
+        assert_eq!(media.len(), media_entries.len());
+        assert!(media
+            .iter()
+            .all(|entry| entry.sidecar_archive_path.as_deref()
+                == Some(second.to_string_lossy().as_ref())));
+        assert!(media.iter().any(
+            |entry| entry.album.as_deref() == Some("Album Ñ") && entry.path.ends_with("猫.jpg")
+        ));
+        let cat = media
+            .iter()
+            .find(|entry| entry.path.ends_with("猫.jpg"))
+            .and_then(|entry| entry.metadata.as_ref())
+            .expect("indexed sidecar metadata");
+        assert_eq!(cat.photo_taken_time, Some(1_700_000_000));
+        assert_eq!(cat.latitude, Some(47.6));
+        assert_eq!(cat.description.as_deref(), Some("A Takeout caption"));
+        assert_eq!(cat.people, vec!["Ada"]);
+        assert!(cat.favorited && cat.archived);
+        assert!(media
+            .iter()
+            .find(|entry| entry.path.ends_with("猫.jpg"))
+            .is_some_and(|entry| entry.archived));
+        assert_eq!(cat.url.as_deref(), Some("https://photos.example/cat"));
+        assert!(media
+            .iter()
+            .any(|entry| { entry.album.is_none() && entry.path.contains("Photos from 2024") }));
+        assert!(media
+            .iter()
+            .any(|entry| entry.archived && entry.path.ends_with("old.jpg")));
+        assert!(media
+            .iter()
+            .any(|entry| entry.trashed && entry.path.ends_with("deleted.jpg")));
+        assert!(media.iter().any(|entry| {
+            entry.path.ends_with(&format!("{long_stem}.jpg"))
+                && entry.sidecar_match.as_deref() == Some("Truncated")
+        }));
+        assert!(media.iter().any(|entry| {
+            entry.path.ends_with("猫.jpg") && entry.sidecar_match.as_deref() == Some("Supplemental")
+        }));
+        assert!(media.iter().any(|entry| {
+            entry.path.ends_with("PXL_1.jpg") && entry.sidecar_match.as_deref() == Some("Exact")
+        }));
+        assert!(media.iter().any(|entry| {
+            entry.path.ends_with("IMG_3(1).jpg")
+                && entry.sidecar_match.as_deref() == Some("NumberedDuplicate")
+        }));
+        assert!(media.iter().any(|entry| {
+            entry.path.ends_with("IMG_4-edited.jpg")
+                && entry.sidecar_match.as_deref() == Some("EditedSuffixStripped")
+        }));
+    }
+
+    #[test]
+    fn archive_entry_paths_reject_traversal() {
+        assert!(normalize_archive_entry_path("../outside.jpg").is_err());
+        assert!(normalize_archive_entry_path("Takeout/../../outside.jpg").is_err());
+        assert_eq!(
+            normalize_archive_entry_path("Takeout\\Photos\\猫.jpg").unwrap(),
+            "Takeout/Photos/猫.jpg"
+        );
+    }
+
+    #[test]
+    fn tar_gz_extension_is_accepted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("takeout.tar.gz");
+        create_tgz(
+            &path,
+            &[
+                ("Takeout/Google Fotos/photo.jpg", b"photo"),
+                (
+                    "Takeout/Google Fotos/photo.jpg.json",
+                    br#"{"title":"photo"}"#,
+                ),
+            ],
+        );
+
+        let summary = inspect_sources(&[path.to_string_lossy().to_string()]).unwrap();
+        let index = index_sources(&[path.to_string_lossy().to_string()]).unwrap();
+        let entries = index.entries().unwrap();
+
+        assert_eq!(summary.archives.len(), 1);
+        assert_eq!(summary.archives[0].archive_type, ArchiveType::Tgz);
+        assert_eq!(summary.archives[0].entry_count, 2);
+        assert!(entries.iter().any(|entry| {
+            entry.path.ends_with("photo.jpg")
+                && entry.sidecar_path.as_deref() == Some("Takeout/Google Fotos/photo.jpg.json")
+        }));
     }
 }

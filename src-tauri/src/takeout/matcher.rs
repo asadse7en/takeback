@@ -1,7 +1,9 @@
-use std::collections::HashMap;
-use std::fs;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufReader;
+
+pub use crate::metadata::TakeoutMetadata as JsonFields;
 
 const EDITED_SUFFIXES: &[&str] = &[
     "-edited",
@@ -27,6 +29,7 @@ const EDITED_SUFFIXES: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum MatchReason {
     Exact,
     Supplemental,
@@ -35,23 +38,6 @@ pub enum MatchReason {
     EditedSuffixStripped,
     Title,
     NoJson,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct JsonFields {
-    pub title: Option<String>,
-    pub description: Option<String>,
-    pub photo_taken_time: Option<i64>,
-    pub creation_time: Option<i64>,
-    pub latitude: Option<f64>,
-    pub longitude: Option<f64>,
-    pub altitude: Option<f64>,
-    pub people: Vec<String>,
-    pub favorited: bool,
-    pub archived: bool,
-    pub trashed: bool,
-    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,86 +52,163 @@ pub struct MediaMatch {
     pub album_membership: Vec<String>,
 }
 
-pub fn match_media_to_json(media_paths: &[String], sidecar_paths: &[String]) -> Vec<MediaMatch> {
-    let mut sidecar_entries: HashMap<String, Vec<String>> = HashMap::new();
-    for sidecar_path in sidecar_paths {
-        let key = normalize_sidecar_name(sidecar_path);
-        sidecar_entries.entry(key).or_default().push(sidecar_path.clone());
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarCandidate {
+    pub archive_path: String,
+    pub path: String,
+    pub title: Option<String>,
+}
 
-    let live_pairs = detect_live_pairs(media_paths);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarMatch {
+    pub archive_path: String,
+    pub path: String,
+    pub reason: MatchReason,
+}
+
+#[derive(Debug, Default)]
+struct SidecarIndex {
+    exact: HashMap<String, Vec<usize>>,
+    supplemental: HashMap<String, Vec<usize>>,
+    truncated: HashMap<String, Vec<usize>>,
+    numbered: HashMap<String, Vec<usize>>,
+    edited: HashMap<String, Vec<usize>>,
+    title: HashMap<String, Vec<usize>>,
+}
+
+pub fn match_sidecars(
+    media_paths: &[String],
+    sidecars: &[SidecarCandidate],
+) -> Vec<Option<SidecarMatch>> {
+    let mut index = SidecarIndex::default();
+    for (candidate_index, candidate) in sidecars.iter().enumerate() {
+        let key = normalize_sidecar_name(&candidate.path);
+        let is_supplemental = candidate
+            .path
+            .to_lowercase()
+            .contains(".supplemental-metadata");
+
+        if is_supplemental {
+            index
+                .supplemental
+                .entry(strip_supplemental_prefix(&key))
+                .or_default()
+                .push(candidate_index);
+        } else {
+            index
+                .exact
+                .entry(key.clone())
+                .or_default()
+                .push(candidate_index);
+        }
+
+        if char_count(&key) == 46 {
+            index
+                .truncated
+                .entry(key.clone())
+                .or_default()
+                .push(candidate_index);
+        }
+        index
+            .numbered
+            .entry(strip_duplicate_suffix(&key))
+            .or_default()
+            .push(candidate_index);
+        index
+            .edited
+            .entry(strip_edited_suffix(&key))
+            .or_default()
+            .push(candidate_index);
+        if let Some(title) = candidate.title.as_deref() {
+            index
+                .title
+                .entry(title.to_lowercase())
+                .or_default()
+                .push(candidate_index);
+        }
+    }
 
     media_paths
         .iter()
         .map(|media_path| {
             let media_name = file_name_key(media_path);
-            let mut reason = MatchReason::NoJson;
-            let mut matched_json: Option<(String, JsonFields)> = None;
+            let media_len = char_count(&media_name);
+            let match_candidate =
+                choose_candidate(index.exact.get(&media_name), media_path, sidecars)
+                    .map(|candidate| (candidate, MatchReason::Exact))
+                    .or_else(|| {
+                        choose_candidate(index.supplemental.get(&media_name), media_path, sidecars)
+                            .map(|candidate| (candidate, MatchReason::Supplemental))
+                    })
+                    .or_else(|| {
+                        if media_len > 46 {
+                            let prefix = take_chars(&media_name, 46);
+                            choose_candidate(index.truncated.get(&prefix), media_path, sidecars)
+                                .map(|candidate| (candidate, MatchReason::Truncated))
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        let key = strip_duplicate_suffix(&media_name);
+                        choose_candidate(index.numbered.get(&key), media_path, sidecars)
+                            .map(|candidate| (candidate, MatchReason::NumberedDuplicate))
+                    })
+                    .or_else(|| {
+                        let key = strip_edited_suffix(&media_name);
+                        choose_candidate(index.edited.get(&key), media_path, sidecars)
+                            .map(|candidate| (candidate, MatchReason::EditedSuffixStripped))
+                    })
+                    .or_else(|| {
+                        let title_key = media_name.replace('_', " ").to_lowercase();
+                        choose_candidate(index.title.get(&title_key), media_path, sidecars)
+                            .or_else(|| {
+                                let without_extension = title_key
+                                    .strip_suffix(".jpg")
+                                    .or_else(|| title_key.strip_suffix(".jpeg"));
+                                without_extension.and_then(|key| {
+                                    choose_candidate(index.title.get(key), media_path, sidecars)
+                                })
+                            })
+                            .map(|candidate| (candidate, MatchReason::Title))
+                    });
 
-            for candidate in sidecar_paths.iter() {
-                let candidate_name = normalize_sidecar_name(candidate);
-                let is_supplemental = candidate.to_ascii_lowercase().contains(".supplemental-metadata");
-                if is_exact_match(&media_name, candidate_name.as_str(), is_supplemental) {
-                    reason = MatchReason::Exact;
-                    matched_json = read_sidecar_json(candidate);
-                    break;
-                }
-                if is_supplemental_match(&media_name, candidate_name.as_str(), candidate) {
-                    reason = MatchReason::Supplemental;
-                    matched_json = read_sidecar_json(candidate);
-                    break;
-                }
-            }
+            match_candidate.map(|(candidate_index, reason)| SidecarMatch {
+                archive_path: sidecars[candidate_index].archive_path.clone(),
+                path: sidecars[candidate_index].path.clone(),
+                reason,
+            })
+        })
+        .collect()
+}
 
-            if matched_json.is_none() {
-                for candidate in sidecar_paths.iter() {
-                    if is_truncated_match(&media_name, normalize_sidecar_name(candidate).as_str()) {
-                        reason = MatchReason::Truncated;
-                        matched_json = read_sidecar_json(candidate);
-                        break;
-                    }
-                }
-            }
+pub fn match_media_to_json(media_paths: &[String], sidecar_paths: &[String]) -> Vec<MediaMatch> {
+    let sidecars: Vec<SidecarCandidate> = sidecar_paths
+        .iter()
+        .map(|path| SidecarCandidate {
+            archive_path: String::new(),
+            path: path.clone(),
+            title: read_sidecar_json(path).and_then(|(_, fields)| fields.title),
+        })
+        .collect();
+    let matches = match_sidecars(media_paths, &sidecars);
+    let live_pairs = detect_live_pairs(media_paths);
 
-            if matched_json.is_none() {
-                for candidate in sidecar_paths.iter() {
-                    if is_numbered_duplicate_match(&media_name, normalize_sidecar_name(candidate).as_str()) {
-                        reason = MatchReason::NumberedDuplicate;
-                        matched_json = read_sidecar_json(candidate);
-                        break;
-                    }
-                }
-            }
-
-            if matched_json.is_none() {
-                for candidate in sidecar_paths.iter() {
-                    if is_edited_suffix_match(&media_name, normalize_sidecar_name(candidate).as_str()) {
-                        reason = MatchReason::EditedSuffixStripped;
-                        matched_json = read_sidecar_json(candidate);
-                        break;
-                    }
-                }
-            }
-
-            if matched_json.is_none() {
-                for candidate in sidecar_paths.iter() {
-                    if matches_title(&media_name, candidate) {
-                        reason = MatchReason::Title;
-                        matched_json = read_sidecar_json(candidate);
-                        break;
-                    }
-                }
-            }
-
-            let (json_path, json) = matched_json
-                .map(|(path, fields)| (Some(path), Some(fields)))
-                .unwrap_or((None, None));
+    media_paths
+        .iter()
+        .zip(matches)
+        .map(|(media_path, matched)| {
+            let json_path = matched.as_ref().map(|item| item.path.clone());
+            let json = json_path
+                .as_deref()
+                .and_then(read_sidecar_json)
+                .map(|(_, fields)| fields);
 
             MediaMatch {
                 media_path: media_path.clone(),
                 json_path: json_path,
                 json,
-                match_reason: reason,
+                match_reason: matched.map_or(MatchReason::NoJson, |item| item.reason),
                 is_edited: is_edited_path(media_path),
                 is_live_pair: live_pairs.contains(media_path),
                 album_membership: album_membership(media_path),
@@ -157,7 +220,7 @@ pub fn match_media_to_json(media_paths: &[String], sidecar_paths: &[String]) -> 
 fn file_name_key(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     let name = normalized.rsplit('/').next().unwrap_or(&normalized);
-    let mut candidate = name.to_ascii_lowercase();
+    let mut candidate = name.to_lowercase();
     if let Some(stripped) = candidate.strip_suffix(".json") {
         candidate = stripped.to_string();
     }
@@ -174,35 +237,24 @@ fn normalize_sidecar_name(path: &str) -> String {
     file_name_key(path)
 }
 
-fn is_exact_match(media_name: &str, sidecar_name: &str, supplemental: bool) -> bool {
-    !supplemental && media_name == sidecar_name
-}
-
-fn is_supplemental_match(media_name: &str, sidecar_name: &str, sidecar_path: &str) -> bool {
-    sidecar_path.to_ascii_lowercase().contains("supplemental-metadata")
-        && media_name == strip_supplemental_prefix(sidecar_name)
-}
-
 fn strip_supplemental_prefix(name: &str) -> String {
-    let normalized = name.to_ascii_lowercase();
+    let normalized = name.to_lowercase();
     normalized
         .strip_suffix(".supplemental-metadata")
         .map(str::to_string)
         .unwrap_or_else(|| normalized)
 }
 
-fn is_truncated_match(media_name: &str, sidecar_name: &str) -> bool {
-    let media = media_name.trim();
-    let sidecar = sidecar_name.trim();
-    if media.len() <= 46 || sidecar.len() >= media.len() {
-        return false;
-    }
-    let expected = &media[..46];
-    sidecar == expected
+fn char_count(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn take_chars(value: &str, count: usize) -> String {
+    value.chars().take(count).collect()
 }
 
 fn strip_duplicate_suffix(name: &str) -> String {
-    let maybe = name.to_ascii_lowercase();
+    let maybe = name.to_lowercase();
     if let Some(open) = maybe.rfind('(') {
         let tail = &maybe[open + 1..];
         if tail.ends_with(')') && tail[..tail.len() - 1].chars().all(|ch| ch.is_ascii_digit()) {
@@ -212,92 +264,51 @@ fn strip_duplicate_suffix(name: &str) -> String {
     maybe
 }
 
-fn is_numbered_duplicate_match(media_name: &str, sidecar_name: &str) -> bool {
-    strip_duplicate_suffix(media_name) == strip_duplicate_suffix(sidecar_name)
-}
-
 fn strip_edited_suffix(name: &str) -> String {
-    let candidate = name.to_ascii_lowercase();
+    let candidate = name.to_lowercase();
     let mut cleaned = candidate.clone();
     for suffix in EDITED_SUFFIXES {
         if cleaned.ends_with(suffix) {
-            cleaned = cleaned.strip_suffix(suffix).unwrap_or(&cleaned).trim().to_string();
-            break;
-        }
-        if let Some(index) = cleaned.rfind(suffix) {
-            let before = &cleaned[..index];
-            cleaned = before.trim().to_string();
+            cleaned = cleaned
+                .strip_suffix(suffix)
+                .unwrap_or(&cleaned)
+                .trim()
+                .to_string();
             break;
         }
     }
     cleaned
 }
 
-fn is_edited_suffix_match(media_name: &str, sidecar_name: &str) -> bool {
-    strip_edited_suffix(media_name) == strip_edited_suffix(sidecar_name)
+fn choose_candidate(
+    matches: Option<&Vec<usize>>,
+    media_path: &str,
+    candidates: &[SidecarCandidate],
+) -> Option<usize> {
+    let media_parent = parent_path(media_path);
+    matches.and_then(|indices| {
+        indices
+            .iter()
+            .copied()
+            .min_by_key(|index| usize::from(parent_path(&candidates[*index].path) != media_parent))
+    })
 }
 
-fn matches_title(media_name: &str, sidecar_path: &str) -> bool {
-    let Some((_, fields)) = read_sidecar_json(sidecar_path) else {
-        return false;
-    };
-    let title = fields.title.as_deref().unwrap_or_default();
-    let alt_title = media_name.replace("_", " ");
-    let title_key = title.to_ascii_lowercase();
-    let match_key = alt_title.to_ascii_lowercase();
-    title_key == match_key || title_key == match_key.replace(".jpg", "").replace(".jpeg", "")
+fn parent_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    normalized
+        .rsplit_once('/')
+        .map_or_else(String::new, |(parent, _)| parent.to_lowercase())
 }
 
 fn read_sidecar_json(path: &str) -> Option<(String, JsonFields)> {
-    let raw = fs::read(path).ok()?;
-    let json: Value = serde_json::from_slice(&raw).ok()?;
-    let title = json.get("title").and_then(Value::as_str).map(str::to_string);
-    let description = json.get("description").and_then(Value::as_str).map(str::to_string);
-    let photo_taken_time = json
-        .get("photoTakenTime")
-        .and_then(|v| v.get("timestamp"))
-        .and_then(Value::as_i64);
-    let creation_time = json
-        .get("creationTime")
-        .and_then(|v| v.get("timestamp"))
-        .and_then(Value::as_i64);
-    let geo = json.get("geoData").or_else(|| json.get("geoDataExif"));
-    let latitude = geo.and_then(|v| v.get("latitude")).and_then(Value::as_f64);
-    let longitude = geo.and_then(|v| v.get("longitude")).and_then(Value::as_f64);
-    let altitude = geo.and_then(|v| v.get("altitude")).and_then(Value::as_f64);
-    let people = json
-        .get("people")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| item.get("name").and_then(Value::as_str).map(str::to_string))
-        .collect();
-    let favorited = json.get("favorited").and_then(Value::as_bool).unwrap_or(false);
-    let archived = json.get("archived").and_then(Value::as_bool).unwrap_or(false);
-    let trashed = json.get("trashed").and_then(Value::as_bool).unwrap_or(false);
-    let url = json.get("url").and_then(Value::as_str).map(str::to_string);
-
-    Some((
-        path.to_string(),
-        JsonFields {
-            title,
-            description,
-            photo_taken_time,
-            creation_time,
-            latitude,
-            longitude,
-            altitude,
-            people,
-            favorited,
-            archived,
-            trashed,
-            url,
-        },
-    ))
+    let file = File::open(path).ok()?;
+    let fields = JsonFields::from_reader(BufReader::new(file)).ok()?;
+    Some((path.to_string(), fields))
 }
 
 fn is_edited_path(path: &str) -> bool {
-    let name = path.to_ascii_lowercase();
+    let name = path.to_lowercase();
     for suffix in EDITED_SUFFIXES {
         if name.contains(suffix) {
             return true;
@@ -306,13 +317,39 @@ fn is_edited_path(path: &str) -> bool {
     false
 }
 
-fn album_membership(path: &str) -> Vec<String> {
+pub fn album_membership(path: &str) -> Vec<String> {
     let normalized = path.replace('\\', "/");
-    normalized
+    let parts: Vec<&str> = normalized
         .split('/')
-        .filter(|part| !part.is_empty() && part.to_ascii_lowercase().contains("album"))
-        .map(str::to_string)
-        .collect()
+        .filter(|part| !part.is_empty())
+        .collect();
+    let photos_root = parts
+        .iter()
+        .position(|part| {
+            ["google photos", "google fotos", "google フォト"]
+                .iter()
+                .any(|root| part.to_lowercase() == *root)
+        })
+        .or_else(|| {
+            parts
+                .iter()
+                .position(|part| part.eq_ignore_ascii_case("takeout"))
+                .and_then(|takeout| (takeout + 1 < parts.len()).then_some(takeout + 1))
+        });
+    let Some(root_index) = photos_root else {
+        return Vec::new();
+    };
+    let Some(album) = parts.get(root_index + 1) else {
+        return Vec::new();
+    };
+    let lower = album.to_lowercase();
+    if lower.starts_with("photos from ")
+        || matches!(lower.as_str(), "trash" | "archive" | "metadata.json")
+    {
+        Vec::new()
+    } else {
+        vec![(*album).to_string()]
+    }
 }
 
 fn detect_live_pairs(media_paths: &[String]) -> std::collections::HashSet<String> {
@@ -324,7 +361,10 @@ fn detect_live_pairs(media_paths: &[String]) -> std::collections::HashSet<String
             .rsplit_once('.')
             .map(|(stem, _)| stem)
             .unwrap_or(file_name);
-        by_basename.entry(base.to_ascii_lowercase()).or_default().push(item.clone());
+        by_basename
+            .entry(base.to_ascii_lowercase())
+            .or_default()
+            .push(item.clone());
     }
 
     let mut live = std::collections::HashSet::new();
@@ -335,7 +375,10 @@ fn detect_live_pairs(media_paths: &[String]) -> std::collections::HashSet<String
         });
         let has_photo = items.iter().any(|item| {
             let lower = item.to_ascii_lowercase();
-            lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".heic") || lower.ends_with(".png")
+            lower.ends_with(".jpg")
+                || lower.ends_with(".jpeg")
+                || lower.ends_with(".heic")
+                || lower.ends_with(".png")
         });
         if has_video && has_photo {
             for item in items {
@@ -402,7 +445,10 @@ mod tests {
             ),
             (
                 edited_media.to_string_lossy().to_string(),
-                vec![edited_media.with_file_name("IMG_4.jpg.json").to_string_lossy().to_string()],
+                vec![edited_media
+                    .with_file_name("IMG_4.jpg.json")
+                    .to_string_lossy()
+                    .to_string()],
                 MatchReason::EditedSuffixStripped,
             ),
             (
@@ -410,17 +456,16 @@ mod tests {
                 vec![title_sidecar.to_string_lossy().to_string()],
                 MatchReason::Title,
             ),
-            (
-                "IMG_999.jpg".to_string(),
-                vec![],
-                MatchReason::NoJson,
-            ),
+            ("IMG_999.jpg".to_string(), vec![], MatchReason::NoJson),
         ];
 
         for (media, sidecars, expected) in cases {
             let matched = match_media_to_json(&[media.clone()], &sidecars);
             assert_eq!(matched.len(), 1, "case for {media}");
-            assert_eq!(matched[0].match_reason, expected, "unexpected reason for {media}");
+            assert_eq!(
+                matched[0].match_reason, expected,
+                "unexpected reason for {media}"
+            );
         }
     }
 

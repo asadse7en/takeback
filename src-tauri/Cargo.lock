@@ -4525,7 +4525,6 @@ dependencies = [
  "chrono-tz",
  "flate2",
  "image",
- "rayon",
  "rusqlite",
  "serde",
  "serde_json",

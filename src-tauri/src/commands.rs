@@ -1,30 +1,76 @@
-use serde::{Deserialize, Serialize};
-
+use crate::archive::AddSourcesResult;
 use crate::engine;
+use crate::error::{AppError, Result};
+use crate::organize::PreviewResult;
+use crate::pipeline::ProcessingStartResult;
 use crate::planner::{MediaItem, PlannerSettings};
+use crate::report::{ReportExport, ReportFormat};
+use crate::settings::Settings;
+use tauri::Manager;
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScanSourcesResult {
-    pub files: Vec<String>,
-    pub counts: Counts,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Counts {
-    pub photos: u32,
-    pub videos: u32,
-    pub live: u32,
-    pub total_gb: f64,
+#[tauri::command]
+pub async fn add_sources(paths: Vec<String>) -> Result<AddSourcesResult> {
+    tauri::async_runtime::spawn_blocking(move || crate::takeout::inspect_sources(&paths))
+        .await
+        .map_err(|error| AppError::Other(format!("Could not inspect sources: {error}")))?
+        .map_err(AppError::Other)
 }
 
 #[tauri::command]
-pub fn scan_sources() -> ScanSourcesResult {
-    ScanSourcesResult {
-        files: vec!["sample-1.zip".into(), "sample-2.zip".into()],
-        counts: Counts { photos: 128, videos: 36, live: 12, total_gb: 18.7 },
-    }
+pub fn remove_source(_source_id: String) -> Result<bool> {
+    Err(AppError::NotImplemented(
+        "Removing sources is not available yet.".to_string(),
+    ))
+}
+
+#[tauri::command]
+pub fn get_preview(_settings: Settings) -> Result<PreviewResult> {
+    Err(AppError::NotImplemented(
+        "Preview generation is not available yet.".to_string(),
+    ))
+}
+
+#[tauri::command]
+pub fn start_processing(_settings: Settings) -> Result<ProcessingStartResult> {
+    Err(AppError::NotImplemented(
+        "Processing is not available yet.".to_string(),
+    ))
+}
+
+#[tauri::command]
+pub fn cancel_processing() -> Result<bool> {
+    Err(AppError::NotImplemented(
+        "Processing cancellation is not available yet.".to_string(),
+    ))
+}
+
+#[tauri::command]
+pub fn load_settings() -> Result<Settings> {
+    Err(AppError::NotImplemented(
+        "Loading settings is not available yet.".to_string(),
+    ))
+}
+
+#[tauri::command]
+pub fn save_settings(_settings: Settings) -> Result<()> {
+    Err(AppError::NotImplemented(
+        "Saving settings is not available yet.".to_string(),
+    ))
+}
+
+#[tauri::command]
+pub fn export_report(_format: ReportFormat) -> Result<ReportExport> {
+    Err(AppError::NotImplemented(
+        "Report export is not available yet.".to_string(),
+    ))
+}
+
+#[tauri::command]
+pub async fn scan_sources(paths: Vec<String>) -> Result<crate::takeout::ScanSourcesResult> {
+    tauri::async_runtime::spawn_blocking(move || crate::takeout::scan_paths(&paths))
+        .await
+        .map_err(|error| AppError::Other(format!("Could not scan sources: {error}")))?
+        .map_err(AppError::Other)
 }
 
 #[tauri::command]
@@ -33,7 +79,7 @@ pub fn preview_tree() -> Vec<String> {
 }
 
 #[tauri::command]
-pub fn start_run() -> bool {
+pub async fn start_run(app: tauri::AppHandle) -> Result<bool> {
     let settings = PlannerSettings::default();
     let items = vec![MediaItem {
         source: "sample/photos/IMG_0134.jpg".to_string(),
@@ -49,26 +95,44 @@ pub fn start_run() -> bool {
         edited: false,
         has_json: true,
         duplicate_of: None,
+        metadata: None,
     }];
-    engine::start_run(&settings, &items).is_ok()
+    let exiftool_path = if items.iter().any(|item| {
+        item.metadata.is_some()
+            && crate::metadata::supports_embedded_metadata(std::path::Path::new(&item.source))
+    }) {
+        let resource_dir = app.path().resource_dir().map_err(|error| {
+            AppError::Other(format!("Could not locate application resources: {error}"))
+        })?;
+        crate::platform::exiftool_path(&resource_dir).map_err(AppError::Other)?
+    } else {
+        std::path::PathBuf::new()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        engine::start_run(&settings, &items, &exiftool_path)
+    })
+    .await
+    .map_err(|error| AppError::Other(format!("Could not start processing: {error}")))?
+    .map(|_| true)
+    .map_err(AppError::Other)
 }
 
 #[tauri::command]
-pub fn pause_run() -> bool {
-    engine::pause_run();
-    true
+pub fn pause_run() -> Result<bool> {
+    engine::pause_run().map_err(AppError::Other)?;
+    Ok(true)
 }
 
 #[tauri::command]
-pub fn resume_run() -> bool {
-    engine::resume_run();
-    true
+pub fn resume_run() -> Result<bool> {
+    engine::resume_run().map_err(AppError::Other)?;
+    Ok(true)
 }
 
 #[tauri::command]
-pub fn cancel_run() -> bool {
-    engine::cancel_run();
-    true
+pub fn cancel_run() -> Result<bool> {
+    engine::cancel_run().map_err(AppError::Other)?;
+    Ok(true)
 }
 
 #[tauri::command]

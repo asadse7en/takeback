@@ -5,20 +5,21 @@ export type Settings = {
   albumMode: 'off' | 'move' | 'link' | 'copy';
   albumLoc: 'top' | 'year';
   multiAlbum: 'first' | 'all';
-  dateFolders: 'off' | 'year' | 'month';
+  dateFolders: 'off' | 'year' | 'yearMonth';
   favoritesMode: 'off' | 'move' | 'link' | 'copy';
   editedMode: 'off' | 'move' | 'link' | 'copy';
   archiveFolder: boolean;
   trashed: 'skip' | 'include' | 'ownFolder';
   editedVersions: 'both' | 'originals' | 'edited';
   mergeLive: boolean;
-  liveStyle: 'separate' | 'iphone' | 'android';
+  liveStyle: 'separate' | 'iphonePair' | 'androidMotionPhoto';
   splitByType: {
     photos: boolean;
     videos: boolean;
     live: boolean;
   };
   fileNames: 'keep' | 'dateTime' | 'dateOriginal' | 'custom';
+  customNamePattern: string;
   sameName: 'number' | 'dateTime' | 'skip';
   ignoreDuplicates: boolean;
   noJson: 'leave' | 'unsorted';
@@ -31,6 +32,8 @@ export type Settings = {
   speed: 'balanced' | 'gentle';
   dryRun: boolean;
 };
+
+export const FREE_SPACE_CHECK_ENABLED = true as const;
 
 export type RunState = {
   completed: number;

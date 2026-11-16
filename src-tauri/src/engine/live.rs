@@ -63,7 +63,11 @@ impl std::fmt::Display for LiveStyle {
     }
 }
 
-pub fn apply_live_style(style: LiveStyle, photo_path: &Path, video_path: &Path) -> Result<(), String> {
+pub fn apply_live_style(
+    style: LiveStyle,
+    photo_path: &Path,
+    video_path: &Path,
+) -> Result<(), String> {
     match style {
         LiveStyle::Separate => Ok(()),
         LiveStyle::Iphone => apply_iphone_live_photo(photo_path, video_path),
@@ -171,8 +175,14 @@ mod tests {
 
     #[test]
     fn experimental_styles_show_the_warning() {
-        assert_eq!(LiveStyle::Iphone.warning_text(), Some("The photo file is modified."));
-        assert_eq!(LiveStyle::Android.warning_text(), Some("The photo file is modified."));
+        assert_eq!(
+            LiveStyle::Iphone.warning_text(),
+            Some("The photo file is modified.")
+        );
+        assert_eq!(
+            LiveStyle::Android.warning_text(),
+            Some("The photo file is modified.")
+        );
         assert_eq!(LiveStyle::Separate.warning_text(), None);
     }
 }

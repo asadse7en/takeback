@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use crate::metadata::TakeoutMetadata;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -183,7 +184,7 @@ impl Default for PlannerSettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaItem {
     pub source: String,
@@ -199,6 +200,7 @@ pub struct MediaItem {
     pub edited: bool,
     pub has_json: bool,
     pub duplicate_of: Option<String>,
+    pub metadata: Option<TakeoutMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +228,7 @@ pub fn preview(settings: &PlannerSettings) -> Vec<String> {
             edited: false,
             has_json: true,
             duplicate_of: None,
+            metadata: None,
         },
         MediaItem {
             source: "sample/photos/IMG_0135.mp4".to_string(),
@@ -241,6 +244,7 @@ pub fn preview(settings: &PlannerSettings) -> Vec<String> {
             edited: false,
             has_json: true,
             duplicate_of: None,
+            metadata: None,
         },
     ];
 
@@ -592,6 +596,7 @@ mod tests {
             edited: false,
             has_json: true,
             duplicate_of: None,
+            metadata: None,
         }
     }
 
@@ -656,6 +661,7 @@ mod tests {
                 edited: false,
                 has_json: true,
                 duplicate_of: None,
+                metadata: None,
             }
         ];
 
