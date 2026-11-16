@@ -1,46 +1,95 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Button, PageFrame, PhotoThumb } from '@/components/Ui';
-import { mockReviewItems } from '@/mock/data';
+import { callCommand, type ReportItem } from '@/lib/api';
+import { useReportStore } from '@/store/report';
 
 type Filter = 'all' | 'no-json' | 'warnings';
-type Choice = 'file-date' | 'pick-date' | 'leave';
+type Choice = 'fileDate' | 'pickDate' | 'leave';
 
-const counts: Record<Filter, number> = { all: 170, 'no-json': 128, warnings: 42 };
 const filterLabels: Record<Filter, string> = { all: 'All', 'no-json': 'No JSON', warnings: 'Warnings' };
 
 export default function ReviewPage() {
   const navigate = useNavigate();
+  const setReport = useReportStore((state) => state.setReport);
   const [filter, setFilter] = useState<Filter>('all');
-  const [selectedFile, setSelectedFile] = useState<string>(mockReviewItems[0].file);
-  const [choice, setChoice] = useState<Choice>('file-date');
-  const [pickedDate, setPickedDate] = useState('2022-01-14T12:00');
-  const [items, setItems] = useState([...mockReviewItems]);
+  const [selectedId, setSelectedId] = useState('');
+  const [choice, setChoice] = useState<Choice>('fileDate');
+  const [pickedDate, setPickedDate] = useState('');
+  const [items, setItems] = useState<ReportItem[]>([]);
   const [applySimilar, setApplySimilar] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
 
-  const filteredItems = useMemo(
-    () => filter === 'all' ? items : items.filter((item) => item.group === filter),
-    [filter, items],
-  );
-  const selected = filteredItems.find((item) => item.file === selectedFile) ?? filteredItems[0];
-  const selectedIndex = selected ? filteredItems.findIndex((item) => item.file === selected.file) + 1 : 0;
+  useEffect(() => {
+    callCommand('get_review_items', {}).then((reviewItems) => {
+      setItems(reviewItems);
+      setSelectedId(reviewItems[0]?.id ?? '');
+    }).catch((reason: unknown) => {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    });
+  }, []);
 
-  const apply = () => {
+  const filteredItems = useMemo(() => {
+    if (filter === 'all') return items;
+    if (filter === 'no-json') return items.filter((item) => item.group === 'no-json');
+    return items.filter((item) => item.group !== 'no-json');
+  }, [filter, items]);
+  const selected = filteredItems.find((item) => item.id === selectedId) ?? filteredItems[0];
+  const counts: Record<Filter, number> = {
+    all: items.length,
+    'no-json': items.filter((item) => item.group === 'no-json').length,
+    warnings: items.filter((item) => item.group !== 'no-json').length,
+  };
+  const selectedIndex = selected ? filteredItems.findIndex((item) => item.id === selected.id) + 1 : 0;
+
+  const apply = async () => {
     if (!selected) return;
-    setItems((current) => current.filter((item) => item.file !== selected.file));
-    setSelectedFile('');
+    setBusy(true);
+    setError('');
+    const targets = applySimilar
+      ? filteredItems.filter((item) => item.reason === selected.reason && item.group === selected.group)
+      : [selected];
+    try {
+      for (const item of targets) {
+        await callCommand('apply_review_fix', {
+          itemId: item.id,
+          choice,
+          pickedDate: choice === 'pickDate' ? pickedDate : null,
+        });
+        setItems((current) => current.filter((entry) => entry.id !== item.id));
+      }
+      const report = await callCommand('get_report', {});
+      setReport(report);
+      const remaining = items.filter((item) => !targets.some((target) => target.id === item.id));
+      setSelectedId(remaining[0]?.id ?? '');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      try {
+        const [reviewItems, report] = await Promise.all([
+          callCommand('get_review_items', {}),
+          callCommand('get_report', {}),
+        ]);
+        setItems(reviewItems);
+        setReport(report);
+      } catch {
+        setError((current) => `${current} The report could not be refreshed.`);
+      }
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
     <PageFrame
       title="Review photos"
-      subtitle="170 files need a look"
+      subtitle={`${items.length.toLocaleString()} files need a look`}
       footer={
         <>
-          <span className="footer-note">{selectedIndex || 1} of 170 selected</span>
+          <span className="footer-note">{selectedIndex || 0} of {filteredItems.length.toLocaleString()} selected</span>
           <div className="footer-buttons">
-            <Button className={applySimilar ? 'is-pressed' : ''} onClick={() => setApplySimilar((value) => !value)}>Apply to all similar</Button>
-            <Button variant="accent" onClick={apply} disabled={!selected}>Apply</Button>
+            <Button className={applySimilar ? 'is-pressed' : ''} disabled={!selected} onClick={() => setApplySimilar((value) => !value)}>Apply to all similar</Button>
+            <Button variant="accent" disabled={!selected || busy || (choice === 'pickDate' && !pickedDate)} onClick={() => void apply()}>{busy ? 'Applying…' : 'Apply'}</Button>
           </div>
         </>
       }
@@ -55,46 +104,47 @@ export default function ReviewPage() {
 
       <div className="review-layout">
         <div className="review-grid" aria-label="Review item thumbnails">
-          {filteredItems.map((item) => (
-            <button type="button" className={`review-item${selected?.file === item.file ? ' is-selected' : ''}`} key={item.file} aria-pressed={selected?.file === item.file} onClick={() => setSelectedFile(item.file)}>
-              <PhotoThumb tone={item.tone} />
+          {filteredItems.map((item, index) => (
+            <button type="button" className={`review-item${selected?.id === item.id ? ' is-selected' : ''}`} key={item.id} aria-pressed={selected?.id === item.id} onClick={() => setSelectedId(item.id)}>
+              <PhotoThumb tone={index % 2 ? 'blue' : 'peach'} />
               <strong>{item.file}</strong>
-              <span className={item.group === 'warnings' ? (item.reason === 'Unreadable EXIF' || item.reason === 'Corrupt video' ? 'review-reason is-danger' : 'review-reason') : 'review-reason'}>{item.reason}</span>
+              <span className={item.group === 'failed' ? 'review-reason is-danger' : 'review-reason'}>{item.reason}</span>
             </button>
           ))}
         </div>
 
         {selected ? (
           <aside className="review-detail" aria-label="Selected item details">
-            <PhotoThumb tone={selected.tone} />
+            <PhotoThumb tone="peach" />
             <strong className="review-detail__title">{selected.file}</strong>
-            <span className="review-detail__origin">Takeout 001 · Photos from 2022</span>
+            <span className="review-detail__origin">{selected.destination ?? selected.group}</span>
             <strong className="review-detail__reason">{selected.reason}</strong>
-            <p>Google did not export the date and location for this file.</p>
+            <p>Choose how Takeback should handle this output file.</p>
             <fieldset className="review-choices">
               <legend className="visually-hidden">Choose how to handle this item</legend>
               <label>
-                <input type="radio" name="review-choice" checked={choice === 'file-date'} onChange={() => setChoice('file-date')} />
-                <span><strong>Use the file date</strong><small>Jan 14, 2022 from the photo itself</small></span>
+                <input type="radio" name="review-choice" checked={choice === 'fileDate'} onChange={() => setChoice('fileDate')} />
+                <span><strong>Use the file date</strong><small>Use the date already stored in the photo</small></span>
               </label>
               <label>
-                <input type="radio" name="review-choice" checked={choice === 'pick-date'} onChange={() => setChoice('pick-date')} />
+                <input type="radio" name="review-choice" checked={choice === 'pickDate'} onChange={() => setChoice('pickDate')} />
                 <span><strong>Pick a date</strong><small>Choose it yourself</small></span>
               </label>
-              {choice === 'pick-date' ? <input className="review-date" type="datetime-local" value={pickedDate} onChange={(event) => setPickedDate(event.target.value)} aria-label="Choose date and time" /> : null}
+              {choice === 'pickDate' ? <input className="review-date" type="datetime-local" value={pickedDate} onChange={(event) => setPickedDate(event.target.value)} aria-label="Choose date and time" /> : null}
               <label>
                 <input type="radio" name="review-choice" checked={choice === 'leave'} onChange={() => setChoice('leave')} />
-                <span><strong>Leave as is</strong><small>Keep the export date</small></span>
+                <span><strong>Leave as is</strong><small>Keep the current output unchanged</small></span>
               </label>
             </fieldset>
           </aside>
         ) : (
           <aside className="review-detail review-detail--empty">
-            <p>No more mock files match this filter.</p>
+            <p>No review items match this filter.</p>
             <Button onClick={() => navigate('/done')}>Back to summary</Button>
           </aside>
         )}
       </div>
+      {error ? <p role="alert" className="form-error">{error}</p> : null}
     </PageFrame>
   );
 }

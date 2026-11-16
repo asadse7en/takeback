@@ -10,7 +10,10 @@ pub fn match_live_pairs(items: &[&str]) -> Vec<MatchPair> {
 
     for item in items {
         if item.ends_with(".jpg") || item.ends_with(".jpeg") || item.ends_with(".png") {
-            let key = item.trim_end_matches(|c| c == '.' || c == 'j' || c == 'p' || c == 'g' || c == 'e' || c == 'n')
+            let key = item
+                .trim_end_matches(|c| {
+                    c == '.' || c == 'j' || c == 'p' || c == 'g' || c == 'e' || c == 'n'
+                })
                 .trim_end_matches('_');
             seen.insert(key, seen.get(key).copied().unwrap_or_default() + 1);
         }
@@ -18,7 +21,9 @@ pub fn match_live_pairs(items: &[&str]) -> Vec<MatchPair> {
 
     for item in items {
         if item.ends_with(".mp4") || item.ends_with(".mov") {
-            let key = item.trim_end_matches(|c| c == '.' || c == 'm' || c == 'p' || c == '4' || c == 'o' || c == 'v');
+            let key = item.trim_end_matches(|c| {
+                c == '.' || c == 'm' || c == 'p' || c == '4' || c == 'o' || c == 'v'
+            });
             if let Some(_) = seen.get(key) {
                 out.push(MatchPair {
                     photo: format!("{}.jpg", key),

@@ -16,6 +16,7 @@ pub mod takeout;
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(commands::PreviewIndexState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
@@ -30,15 +31,11 @@ pub fn run() {
             commands::save_settings,
             commands::export_report,
             commands::scan_sources,
-            commands::preview_tree,
-            commands::start_run,
             commands::pause_run,
             commands::resume_run,
-            commands::cancel_run,
             commands::get_report,
             commands::get_review_items,
             commands::apply_review_fix,
-            commands::disk_space,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,157 +1,29 @@
-import { useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Archive, CalendarDays, Check, Copy, FileText, Folder, FolderOpen,
   Grid2X2, Heart, Image, MapPin, Pencil, Settings2, Star, X,
 } from 'lucide-react';
+import { open } from '@tauri-apps/plugin-dialog';
 import { Button, PageFrame, Panel, SegmentedControl, Toggle } from '@/components/Ui';
-import { mockPreviewMedia, mockSettings } from '@/mock/data';
-
-type SettingsState = {
-  albums: string;
-  dates: string;
-  favorites: string;
-  archive: boolean;
-  versions: string;
-  albumLocation: string;
-  editedMode: string;
-  trashed: string;
-  noJson: string;
-  live: boolean;
-  splitPhotos: boolean;
-  splitVideos: boolean;
-  splitLive: boolean;
-};
-
-const initialSettings: SettingsState = {
-  albums: mockSettings.albums,
-  dates: mockSettings.dateFolders,
-  favorites: mockSettings.favorites,
-  archive: mockSettings.archiveFolder,
-  versions: mockSettings.editedPhotos,
-  albumLocation: 'Top level',
-  editedMode: 'Move',
-  trashed: 'Skip',
-  noJson: 'Put in Unsorted',
-  live: mockSettings.mergeLivePhotos,
-  splitPhotos: false,
-  splitVideos: false,
-  splitLive: false,
-};
+import { callCommand, type PreviewNode, type PreviewResult } from '@/lib/api';
+import { useRunStore } from '@/store/run';
+import { useSettingsStore } from '@/store/settings';
+import type { Settings } from '@/types/app';
 
 const folderOptions = ['Off', 'Move', 'Link', 'Copy'] as const;
+type FolderLabel = typeof folderOptions[number];
+type PreviewGuide = 'empty' | 'vertical' | 'tee' | 'last';
+type PreviewLine = Omit<PreviewNode, 'children'> & { children: undefined; guides: PreviewGuide[] };
 
-type PreviewNode = {
-  name: string;
-  folder: boolean;
-  tag?: string;
-  children: PreviewNode[];
+const folderLabels: Record<Settings['albumMode'], FolderLabel> = {
+  off: 'Off', move: 'Move', link: 'Link', copy: 'Copy',
+};
+const folderModes: Record<FolderLabel, Settings['albumMode']> = {
+  Off: 'off', Move: 'move', Link: 'link', Copy: 'copy',
 };
 
-type PreviewGuide = 'empty' | 'vertical' | 'tee' | 'last';
-type PreviewLine = Omit<PreviewNode, 'children'> & { guides: PreviewGuide[] };
-
-function createPreviewTree(settings: SettingsState): PreviewLine[] {
-  const roots: PreviewNode[] = [];
-
-  const addFile = (folders: string[], name: string, tag?: string) => {
-    let children = roots;
-    for (const folderName of folders) {
-      let folder = children.find((node) => node.folder && node.name === folderName);
-      if (!folder) {
-        folder = { name: folderName, folder: true, children: [] };
-        children.push(folder);
-      }
-      children = folder.children;
-    }
-    children.push({ name, folder: false, ...(tag ? { tag } : {}), children: [] });
-  };
-
-  for (const media of mockPreviewMedia) {
-    if (media.trashed && settings.trashed === 'Skip') continue;
-    if (!media.hasJson && settings.noJson === 'Leave in place') continue;
-
-    const isLive = 'live' in media && media.live;
-    const dateFolders = () => settings.dates === 'Off'
-      ? []
-      : settings.dates === 'Year'
-        ? [media.year]
-        : [media.year, media.month];
-    const albumFolders = (name: string) => settings.albumLocation === 'Inside year folders'
-      ? [media.year, name]
-      : [name];
-
-    let files: { name: string; type: string; editedVersion?: boolean; tag?: string }[];
-    if (isLive && settings.live) {
-      files = [{ name: `${media.name} + .mov`, type: 'Live', tag: 'Live' }];
-    } else if (isLive) {
-      files = [
-        { name: media.name, type: 'Photos', editedVersion: false },
-        { name: media.name.replace(/\.jpg$/i, '.mov'), type: 'Videos', editedVersion: false },
-      ];
-    } else if (media.edited && settings.versions === 'Edited only') {
-      files = [{ name: media.name.replace(/(\.[^.]+)$/, '-edited$1'), type: media.type, editedVersion: true }];
-    } else if (media.edited && settings.versions === 'Keep both') {
-      files = [
-        { name: media.name, type: media.type, editedVersion: false },
-        { name: media.name.replace(/(\.[^.]+)$/, '-edited$1'), type: media.type, editedVersion: true },
-      ];
-    } else {
-      files = [{ name: media.name, type: media.type, editedVersion: false }];
-    }
-
-    const withTypeFolder = (folders: string[], type: string) => {
-      if (type === 'Photos' && settings.splitPhotos) return [...folders, 'Photos'];
-      if (type === 'Videos' && settings.splitVideos) return [...folders, 'Videos'];
-      if (type === 'Live' && settings.splitLive) return [...folders, 'Live photos'];
-      return folders;
-    };
-
-    for (const file of files) {
-      if (!media.hasJson) {
-        addFile(['Unsorted'], file.name, file.tag);
-        continue;
-      }
-      if (media.trashed && settings.trashed === 'Own folder') {
-        addFile(['Trash'], file.name, file.tag);
-        continue;
-      }
-
-      const archiveIsMoved = media.archived && settings.archive;
-      const favoriteIsMoved = media.favorite && settings.favorites === 'Move';
-      const editedIsMoved = file.editedVersion && settings.editedMode === 'Move';
-      let normalFolders = archiveIsMoved
-        ? ['Archive']
-        : settings.albums === 'Move' && media.album
-          ? albumFolders(media.album)
-          : dateFolders();
-      let mainIsFlat = archiveIsMoved;
-      if (favoriteIsMoved) {
-        normalFolders = ['Favorites'];
-        mainIsFlat = true;
-      }
-      if (editedIsMoved) {
-        normalFolders = ['Edited'];
-        mainIsFlat = true;
-      }
-
-      if (!mainIsFlat) normalFolders = withTypeFolder(normalFolders, file.type);
-      addFile(normalFolders, file.name, file.tag);
-
-      if (media.album && (settings.albums === 'Link' || settings.albums === 'Copy')) {
-        addFile(withTypeFolder(albumFolders(media.album), file.type), file.name, settings.albums);
-      }
-
-      if (media.favorite && (settings.favorites === 'Link' || settings.favorites === 'Copy')) {
-        addFile(['Favorites'], file.name, settings.favorites);
-      }
-
-      if (file.editedVersion && (settings.editedMode === 'Link' || settings.editedMode === 'Copy')) {
-        addFile(['Edited'], file.name, settings.editedMode);
-      }
-    }
-  }
-
+function flattenTree(nodes: PreviewNode[]): PreviewLine[] {
   const compact = (node: PreviewNode): PreviewNode => {
     let name = node.name;
     let current = node;
@@ -161,13 +33,8 @@ function createPreviewTree(settings: SettingsState): PreviewLine[] {
     }
     return { ...current, name };
   };
-
-  const flatten = (
-    nodes: PreviewNode[],
-    depth: number,
-    ancestorsContinue: boolean[],
-  ): PreviewLine[] => {
-    const sorted = [...nodes].sort((a, b) => Number(b.folder) - Number(a.folder) || a.name.localeCompare(b.name));
+  const flatten = (items: PreviewNode[], depth: number, ancestorsContinue: boolean[]): PreviewLine[] => {
+    const sorted = [...items].sort((a, b) => Number(b.folder) - Number(a.folder) || a.name.localeCompare(b.name));
     return sorted.flatMap((rawNode, index): PreviewLine[] => {
       const isLast = index === sorted.length - 1;
       const node = compact(rawNode);
@@ -175,28 +42,82 @@ function createPreviewTree(settings: SettingsState): PreviewLine[] {
         ...ancestorsContinue.map((continues): PreviewGuide => continues ? 'vertical' : 'empty'),
       ];
       if (depth > 0) guides.push(isLast ? 'last' : 'tee');
-      const childAncestors = depth === 0
-        ? ancestorsContinue
-        : [...ancestorsContinue, !isLast];
+      const childAncestors = depth === 0 ? ancestorsContinue : [...ancestorsContinue, !isLast];
       return [
-        { name: node.name, folder: node.folder, ...(node.tag ? { tag: node.tag } : {}), guides },
+        { name: node.name, folder: node.folder, tag: node.tag, children: undefined, guides },
         ...flatten(node.children, depth + 1, childAncestors),
       ];
     });
   };
+  return flatten(nodes, 0, []);
+}
 
-  return flatten([{ name: 'Photo Library', folder: true, children: roots }], 0, []);
+function folderSize(bytes: number) {
+  return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
+}
+
+function toLocalLabel(mode: Settings['timeZone']) {
+  return ({ local: "Photo's local time", computer: 'Computer time', utc: 'UTC' })[mode];
 }
 
 export default function PreferencesPage() {
   const navigate = useNavigate();
-  const [settings, setSettings] = useState(initialSettings);
+  const settings = useSettingsStore((state) => state.settings);
+  const updateSettings = useSettingsStore((state) => state.updateSettings);
+  const replaceSettings = useSettingsStore((state) => state.replaceSettings);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [activeTab, setActiveTab] = useState('Folders');
-  const [previewOnly, setPreviewOnly] = useState(false);
-  const update = <K extends keyof SettingsState>(key: K, value: SettingsState[K]) =>
-    setSettings((current) => ({ ...current, [key]: value }));
-  const previewTree = useMemo(() => createPreviewTree(settings), [settings]);
+  const [preview, setPreview] = useState<PreviewResult>({
+    files: [], tree: [], warnings: [], requiredBytes: 0, freeBytes: 0,
+  });
+  const [error, setError] = useState('');
+  const previewTree = useMemo(() => flattenTree(preview.tree), [preview.tree]);
+  const outputName = preview.tree[0]?.name ?? 'Photo Library';
+  const freeAfter = Math.max(0, preview.freeBytes - preview.requiredBytes);
+
+  useEffect(() => {
+    let active = true;
+    callCommand('load_settings', {}).then((loaded) => {
+      if (active) replaceSettings(loaded);
+    }).catch((reason: unknown) => {
+      if (active) setError(reason instanceof Error ? reason.message : String(reason));
+    });
+    return () => { active = false; };
+  }, [replaceSettings]);
+
+  useEffect(() => {
+    let active = true;
+    const timer = window.setTimeout(() => {
+      callCommand('get_preview', { settings }).then((result) => {
+        if (active) setPreview(result);
+      }).catch((reason: unknown) => {
+        if (active) setError(reason instanceof Error ? reason.message : String(reason));
+      });
+    }, 120);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [settings]);
+
+  const updateFolder = (key: 'albumMode' | 'favoritesMode' | 'editedMode', label: string) => {
+    if (label in folderModes) updateSettings({ [key]: folderModes[label as FolderLabel] });
+  };
+  const browseOutput = async () => {
+    const selected = await open({ directory: true, multiple: false });
+    if (typeof selected === 'string') updateSettings({ outputFolder: selected });
+  };
+  const start = async () => {
+    setError('');
+    try {
+      await callCommand('save_settings', { settings });
+      useRunStore.getState().reset();
+      navigate('/progress');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
 
   return (
     <>
@@ -207,12 +128,12 @@ export default function PreferencesPage() {
         footer={
           <>
             <label className="preview-only">
-              <input type="checkbox" checked={previewOnly} onChange={(event) => setPreviewOnly(event.target.checked)} />
+              <input type="checkbox" checked={settings.dryRun} onChange={(event) => updateSettings({ dryRun: event.target.checked })} />
               Preview only
             </label>
             <div className="footer-buttons">
               <Button onClick={() => navigate('/add')}>Back</Button>
-              <Button variant="accent" onClick={() => navigate('/progress')}>Start</Button>
+              <Button variant="accent" onClick={() => void start()}>Start</Button>
             </div>
           </>
         }
@@ -222,42 +143,52 @@ export default function PreferencesPage() {
             <Panel className="output-folder">
               <strong>Output folder</strong>
               <div className="output-path-row">
-                <div className="output-path"><Folder size={17} aria-hidden="true" />{mockSettings.outputFolder}</div>
-                <Button>Browse</Button>
+                <div className="output-path"><Folder size={17} aria-hidden="true" />{settings.outputFolder ?? outputName}</div>
+                <Button onClick={() => void browseOutput()}>Browse</Button>
               </div>
-              <div className="disk-meter" aria-label="Disk space: 280 GB used, 131 GB for this export, 101 GB free after">
+              <div className="disk-meter" aria-label={`Required ${folderSize(preview.requiredBytes)}, free ${folderSize(preview.freeBytes)}`}>
                 <span /><span /><span />
               </div>
               <div className="disk-legend">
-                <span>D:</span><span><i className="swatch swatch--used" />280 GB used</span>
-                <span><i className="swatch swatch--need" />131 GB this export</span>
-                <span><i className="swatch swatch--free" />101 GB free after</span>
+                <span>Disk space</span>
+                <span><i className="swatch swatch--need" />{folderSize(preview.requiredBytes)} this export</span>
+                <span><i className="swatch swatch--free" />{folderSize(freeAfter)} free after</span>
               </div>
             </Panel>
 
             <Panel className="preference-list">
-              <PreferenceRow icon={<FolderOpen />} title="Albums" detail="14 albums found">
-                <SegmentedControl label="Album handling" options={folderOptions} value={settings.albums} onChange={(value) => update('albums', value)} />
+              <PreferenceRow icon={<FolderOpen />} title="Albums" detail="From the indexed Takeout files">
+                <SegmentedControl label="Album handling" options={folderOptions} value={folderLabels[settings.albumMode]} onChange={(value) => updateFolder('albumMode', value)} />
               </PreferenceRow>
               <PreferenceRow icon={<CalendarDays />} title="Date folders">
-                <SegmentedControl label="Date folders" options={['Off', 'Year', 'Year › Month']} value={settings.dates} onChange={(value) => update('dates', value)} />
+                <SegmentedControl
+                  label="Date folders"
+                  options={['Off', 'Year', 'Year › Month']}
+                  value={settings.dateFolders === 'yearMonth' ? 'Year › Month' : settings.dateFolders === 'year' ? 'Year' : 'Off'}
+                  onChange={(value) => updateSettings({ dateFolders: value === 'Year › Month' ? 'yearMonth' : value.toLowerCase() as Settings['dateFolders'] })}
+                />
               </PreferenceRow>
-              <PreferenceRow icon={<Star />} title="Favorites" detail="1,032 starred photos found">
-                <SegmentedControl label="Favorite handling" options={folderOptions} value={settings.favorites} onChange={(value) => update('favorites', value)} />
+              <PreferenceRow icon={<Star />} title="Favorites" detail="Starred photos from Takeout">
+                <SegmentedControl label="Favorite handling" options={folderOptions} value={folderLabels[settings.favoritesMode]} onChange={(value) => updateFolder('favoritesMode', value)} />
               </PreferenceRow>
-              <PreferenceRow icon={<Pencil />} title="Edited photos" detail="2,140 edited photos found">
-                <SegmentedControl label="Edited photos" options={['Keep both', 'Originals only', 'Edited only']} value={settings.versions} onChange={(value) => update('versions', value)} />
+              <PreferenceRow icon={<Pencil />} title="Edited photos" detail="Choose which versions to keep">
+                <SegmentedControl
+                  label="Edited photos"
+                  options={['Keep both', 'Originals only', 'Edited only']}
+                  value={settings.editedVersions === 'both' ? 'Keep both' : settings.editedVersions === 'originals' ? 'Originals only' : 'Edited only'}
+                  onChange={(value) => updateSettings({ editedVersions: value === 'Keep both' ? 'both' : value === 'Originals only' ? 'originals' : 'edited' })}
+                />
               </PreferenceRow>
-              <PreferenceRow icon={<Image />} title="Live photos" detail="340 live photos found">
+              <PreferenceRow icon={<Image />} title="Live photos" detail="Set the output pair style in Advanced options">
                 <span className="preference-control">
-                  {settings.live ? <span className="tag">iPhone style</span> : null}
-                  <Toggle label="Keep live photos together" checked={settings.live} onChange={(value) => update('live', value)} />
+                  {settings.mergeLive ? <span className="tag">{settings.liveStyle}</span> : null}
+                  <Toggle label="Keep live photos together" checked={settings.mergeLive} onChange={(mergeLive) => updateSettings({ mergeLive })} />
                 </span>
               </PreferenceRow>
-              <PreferenceRow icon={<Archive />} title="Archive" detail="214 archived photos found">
-                <Toggle label="Organize archived photos" checked={settings.archive} onChange={(value) => update('archive', value)} />
+              <PreferenceRow icon={<Archive />} title="Archive" detail="Organize archived photos">
+                <Toggle label="Organize archived photos" checked={settings.archiveFolder} onChange={(archiveFolder) => updateSettings({ archiveFolder })} />
               </PreferenceRow>
-              <PreferenceRow icon={<Settings2 />} title="Advanced options" detail="All defaults">
+              <PreferenceRow icon={<Settings2 />} title="Advanced options" detail="Names, dates, and metadata">
                 <Button onClick={() => setAdvancedOpen(true)}>Open</Button>
               </PreferenceRow>
             </Panel>
@@ -278,9 +209,12 @@ export default function PreferencesPage() {
                   {item.tag ? <span className="tag">{item.tag}</span> : null}
                 </div>
               ))}
+              {!previewTree.length ? <p className="empty-state">Add and scan Takeout files to see a preview.</p> : null}
             </div>
+            {preview.warnings.map((warning) => <p role="status" key={warning} className="form-error">{warning}</p>)}
           </Panel>
         </div>
+        {error ? <p role="alert" className="form-error">{error}</p> : null}
       </PageFrame>
 
       {advancedOpen ? (
@@ -298,67 +232,60 @@ export default function PreferencesPage() {
             <div className="advanced-options">
               {activeTab === 'Folders' ? (
                 <>
-                  <AdvancedRow
-                    icon={<Folder />}
-                    title="Where albums go"
-                    options={['Top level', 'Inside year folders']}
-                    value={settings.albumLocation}
-                    onChange={(value) => update('albumLocation', value)}
-                  />
-                  <AdvancedRow icon={<Copy />} title="Photo in several albums" options={['First album only', 'Keep in all']} />
-                  <AdvancedRow
-                    icon={<Pencil />}
-                    title="Edited photos folder"
-                    detail="Collect edited versions in one folder"
-                    options={folderOptions}
-                    value={settings.editedMode}
-                    onChange={(value) => update('editedMode', value)}
-                  />
-                  <AdvancedRow
-                    icon={<Archive />}
-                    title="Trashed items"
-                    detail="18 found in your export"
-                    options={['Skip', 'Include', 'Own folder']}
-                    value={settings.trashed}
-                    onChange={(value) => update('trashed', value)}
-                  />
+                  <AdvancedRow icon={<Folder />} title="Where albums go" options={['Top level', 'Inside year folders']} value={settings.albumLoc === 'top' ? 'Top level' : 'Inside year folders'} onChange={(value) => updateSettings({ albumLoc: value === 'Top level' ? 'top' : 'year' })} />
+                  <AdvancedRow icon={<Copy />} title="Photo in several albums" options={['First album only', 'Keep in all']} value={settings.multiAlbum === 'first' ? 'First album only' : 'Keep in all'} onChange={(value) => updateSettings({ multiAlbum: value === 'First album only' ? 'first' : 'all' })} />
+                  <AdvancedRow icon={<Pencil />} title="Edited photos folder" detail="Collect edited versions in one folder" options={folderOptions} value={folderLabels[settings.editedMode]} onChange={(value) => updateFolder('editedMode', value)} />
+                  <AdvancedRow icon={<Archive />} title="Trashed items" options={['Skip', 'Include', 'Own folder']} value={settings.trashed === 'ownFolder' ? 'Own folder' : settings.trashed === 'include' ? 'Include' : 'Skip'} onChange={(value) => updateSettings({ trashed: value === 'Own folder' ? 'ownFolder' : value.toLowerCase() as Settings['trashed'] })} />
                   <PreferenceRow icon={<Grid2X2 />} title="Sort into folders by type" detail="Inside every album and date folder">
                     <div className="checkbox-options">
-                      <label><input type="checkbox" checked={settings.splitPhotos} onChange={(event) => update('splitPhotos', event.target.checked)} /> Photos</label>
-                      <label><input type="checkbox" checked={settings.splitVideos} onChange={(event) => update('splitVideos', event.target.checked)} /> Videos</label>
-                      <label><input type="checkbox" checked={settings.splitLive} onChange={(event) => update('splitLive', event.target.checked)} /> Live</label>
+                      <label><input type="checkbox" checked={settings.splitByType.photos} onChange={(event) => updateSettings({ splitByType: { ...settings.splitByType, photos: event.target.checked } })} /> Photos</label>
+                      <label><input type="checkbox" checked={settings.splitByType.videos} onChange={(event) => updateSettings({ splitByType: { ...settings.splitByType, videos: event.target.checked } })} /> Videos</label>
+                      <label><input type="checkbox" checked={settings.splitByType.live} onChange={(event) => updateSettings({ splitByType: { ...settings.splitByType, live: event.target.checked } })} /> Live</label>
                     </div>
                   </PreferenceRow>
                 </>
               ) : null}
+              {confirmDeleteOpen ? (
+                <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setConfirmDeleteOpen(false); }}>
+                  <section className="advanced-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-confirm-title">
+                    <header className="advanced-dialog__header"><h2 id="delete-confirm-title">Delete each zip after it is processed?</h2></header>
+                    <p className="delete-confirm-copy">Each Takeout file is permanently deleted once its photos are saved and checked. It does not go to the Recycle Bin or Trash. To run Takeback again you would need to download your Takeout again. Your Google Photos library is not affected.</p>
+                    <footer className="advanced-dialog__footer">
+                      <Button onClick={() => setConfirmDeleteOpen(false)}>Cancel</Button>
+                      <Button variant="accent" onClick={() => {
+                        updateSettings({ deleteArchivesAfter: true });
+                        setConfirmDeleteOpen(false);
+                      }}>Delete zips as I go</Button>
+                    </footer>
+                  </section>
+                </div>
+              ) : null}
               {activeTab === 'Names and duplicates' ? (
                 <>
-                  <AdvancedRow icon={<FileText />} title="File names" options={['Keep', 'Date and time', 'Date and original']} />
-                  <AdvancedRow icon={<Copy />} title="If two files have the same name" options={['Add a number', 'Use date and time', 'Skip']} />
-                  <AdvancedToggle icon={<Check />} title="Ignore exact duplicates" checked />
-                  <AdvancedRow
-                    icon={<Folder />}
-                    title="Files without JSON"
-                    options={['Leave in place', 'Put in Unsorted']}
-                    value={settings.noJson}
-                    onChange={(value) => update('noJson', value)}
-                  />
+                  <AdvancedRow icon={<FileText />} title="File names" options={['Keep', 'Date and time', 'Date and original', 'Custom']} value={settings.fileNames === 'dateTime' ? 'Date and time' : settings.fileNames === 'dateOriginal' ? 'Date and original' : settings.fileNames === 'custom' ? 'Custom' : 'Keep'} onChange={(value) => updateSettings({ fileNames: value === 'Date and time' ? 'dateTime' : value === 'Date and original' ? 'dateOriginal' : value === 'Custom' ? 'custom' : 'keep' })} />
+                  {settings.fileNames === 'custom' ? <label className="custom-pattern">Naming pattern<input value={settings.customNamePattern} onChange={(event) => updateSettings({ customNamePattern: event.target.value })} /></label> : null}
+                  <AdvancedRow icon={<Copy />} title="If two files have the same name" options={['Add a number', 'Use date and time', 'Skip']} value={settings.sameName === 'dateTime' ? 'Use date and time' : settings.sameName === 'skip' ? 'Skip' : 'Add a number'} onChange={(value) => updateSettings({ sameName: value === 'Use date and time' ? 'dateTime' : value === 'Skip' ? 'skip' : 'number' })} />
+                  <AdvancedToggle icon={<Check />} title="Ignore exact duplicates" checked={settings.ignoreDuplicates} onChange={(ignoreDuplicates) => updateSettings({ ignoreDuplicates })} />
+                  <AdvancedRow icon={<Folder />} title="Files without JSON" options={['Leave in place', 'Put in Unsorted']} value={settings.noJson === 'leave' ? 'Leave in place' : 'Put in Unsorted'} onChange={(value) => updateSettings({ noJson: value === 'Leave in place' ? 'leave' : 'unsorted' })} />
                 </>
               ) : null}
               {activeTab === 'Dates and metadata' ? (
                 <>
-                  <AdvancedRow icon={<CalendarDays />} title="Time zone" options={["Photo's local time", "Computer time", 'UTC']} />
-                  <AdvancedRow icon={<CalendarDays />} title="If a photo has no date" options={['Use file name', 'Use file date', 'Leave blank']} />
-                  <AdvancedToggle icon={<MapPin />} title="Write location" checked />
-                  <AdvancedToggle icon={<Pencil />} title="Write descriptions and people tags" checked />
-                  <AdvancedToggle icon={<Heart />} title="Rate favorites 5 stars" checked />
+                  <AdvancedRow icon={<CalendarDays />} title="Time zone" options={["Photo's local time", 'Computer time', 'UTC']} value={toLocalLabel(settings.timeZone)} onChange={(value) => updateSettings({ timeZone: value === 'Computer time' ? 'computer' : value === 'UTC' ? 'utc' : 'local' })} />
+                  <AdvancedRow icon={<CalendarDays />} title="If a photo has no date" options={['Use file name', 'Use file date', 'Leave blank']} value={settings.noDate === 'fileName' ? 'Use file name' : settings.noDate === 'fileDate' ? 'Use file date' : 'Leave blank'} onChange={(value) => updateSettings({ noDate: value === 'Use file date' ? 'fileDate' : value === 'Leave blank' ? 'blank' : 'fileName' })} />
+                  <AdvancedToggle icon={<MapPin />} title="Write location" checked={settings.writeGps} onChange={(writeGps) => updateSettings({ writeGps })} />
+                  <AdvancedToggle icon={<Pencil />} title="Write descriptions and people tags" checked={settings.writeDescriptions} onChange={(writeDescriptions) => updateSettings({ writeDescriptions })} />
+                  <AdvancedToggle icon={<Heart />} title="Rate favorites 5 stars" checked={settings.rateFavorites} onChange={(rateFavorites) => updateSettings({ rateFavorites })} />
                 </>
               ) : null}
               {activeTab === 'More' ? (
                 <>
-                  <AdvancedRow icon={<Image />} title="Live photo style" options={['iPhone', 'Android', 'Separate files']} />
-                  <AdvancedToggle icon={<Archive />} title="Delete each zip after it is processed" />
-                  <AdvancedRow icon={<Settings2 />} title="Speed" options={['Balanced', 'Gentle']} />
+                  <AdvancedRow icon={<Image />} title="Live photo style" options={['iPhone', 'Android', 'Separate files']} value={settings.liveStyle === 'iphonePair' ? 'iPhone' : settings.liveStyle === 'androidMotionPhoto' ? 'Android' : 'Separate files'} onChange={(value) => updateSettings({ liveStyle: value === 'iPhone' ? 'iphonePair' : value === 'Android' ? 'androidMotionPhoto' : 'separate' })} />
+                  <AdvancedToggle icon={<Archive />} title="Delete each zip after it is processed" checked={settings.deleteArchivesAfter} onChange={(enabled) => {
+                    if (enabled) setConfirmDeleteOpen(true);
+                    else updateSettings({ deleteArchivesAfter: false });
+                  }} />
+                  <AdvancedRow icon={<Settings2 />} title="Speed" options={['Balanced', 'Gentle']} value={settings.speed === 'gentle' ? 'Gentle' : 'Balanced'} onChange={(value) => updateSettings({ speed: value === 'Gentle' ? 'gentle' : 'balanced' })} />
                 </>
               ) : null}
             </div>
@@ -384,26 +311,29 @@ function PreferenceRow({ icon, title, detail, children }: { icon: ReactNode; tit
 }
 
 function AdvancedRow({
-  icon, title, detail, options, value: controlledValue, onChange,
+  icon, title, detail, options, value, onChange,
 }: {
   icon: ReactNode;
   title: string;
   detail?: string;
   options: readonly string[];
-  value?: string;
-  onChange?: (value: string) => void;
+  value: string;
+  onChange: (value: string) => void;
 }) {
-  const [localValue, setLocalValue] = useState(options[0]);
-  const value = controlledValue ?? localValue;
   return (
     <PreferenceRow icon={icon} title={title} detail={detail}>
-      <SegmentedControl label={title} options={options} value={value} onChange={onChange ?? setLocalValue} />
+      <SegmentedControl label={title} options={options} value={value} onChange={onChange} />
     </PreferenceRow>
   );
 }
 
-function AdvancedToggle({ icon, title, checked: initialChecked = false }: { icon: ReactNode; title: string; checked?: boolean }) {
-  const [checked, setChecked] = useState(initialChecked);
-  return <PreferenceRow icon={icon} title={title}><Toggle label={title} checked={checked} onChange={setChecked} /></PreferenceRow>;
+function AdvancedToggle({
+  icon, title, checked, onChange,
+}: {
+  icon: ReactNode;
+  title: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return <PreferenceRow icon={icon} title={title}><Toggle label={title} checked={checked} onChange={onChange} /></PreferenceRow>;
 }
-

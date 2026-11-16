@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::process::Command;
+
+use crate::metadata::ExifTool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LiveStyle {
@@ -19,15 +20,15 @@ impl LiveStyle {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Separate => "separate",
-            Self::Iphone => "iphone",
-            Self::Android => "android",
+            Self::Iphone => "iphonePair",
+            Self::Android => "androidMotionPhoto",
         }
     }
 
     pub fn from_value(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
-            "iphone" => Self::Iphone,
-            "android" => Self::Android,
+            "iphone" | "iphonepair" => Self::Iphone,
+            "android" | "androidmotionphoto" => Self::Android,
             _ => Self::Separate,
         }
     }
@@ -64,102 +65,22 @@ impl std::fmt::Display for LiveStyle {
 }
 
 pub fn apply_live_style(
+    exiftool: &mut ExifTool,
     style: LiveStyle,
     photo_path: &Path,
-    video_path: &Path,
+    video_path: Option<&Path>,
+    content_identifier: &str,
 ) -> Result<(), String> {
     match style {
         LiveStyle::Separate => Ok(()),
-        LiveStyle::Iphone => apply_iphone_live_photo(photo_path, video_path),
-        LiveStyle::Android => apply_android_motion_photo(photo_path, video_path),
+        LiveStyle::Iphone => exiftool.write_live_content_identifier(photo_path, content_identifier),
+        LiveStyle::Android => {
+            let video_path = video_path.ok_or_else(|| {
+                "the matched video source is unavailable for this motion photo".to_string()
+            })?;
+            exiftool.embed_motion_video(photo_path, video_path, content_identifier)
+        }
     }
-}
-
-fn apply_iphone_live_photo(photo_path: &Path, video_path: &Path) -> Result<(), String> {
-    let content_id = build_content_identifier(photo_path, video_path, "live-photo");
-    let photo_args = vec![
-        "-overwrite_original".to_string(),
-        format!("-XMP:ContentIdentifier={content_id}"),
-        format!("-ContentIdentifier={content_id}"),
-        photo_path.to_string_lossy().to_string(),
-    ];
-    let video_args = vec![
-        "-overwrite_original".to_string(),
-        format!("-XMP:ContentIdentifier={content_id}"),
-        format!("-ContentIdentifier={content_id}"),
-        video_path.to_string_lossy().to_string(),
-    ];
-
-    run_exiftool(&photo_args)?;
-    run_exiftool(&video_args)?;
-    Ok(())
-}
-
-fn apply_android_motion_photo(photo_path: &Path, video_path: &Path) -> Result<(), String> {
-    let content_id = build_content_identifier(photo_path, video_path, "motion-photo");
-    let args = vec![
-        "-overwrite_original".to_string(),
-        "-XMP-GCamera:MicroVideo=1".to_string(),
-        "-XMP-GCamera:MicroVideoVersion=1".to_string(),
-        "-XMP-GCamera:MotionPhoto=1".to_string(),
-        format!("-XMP-GCamera:ContentIdentifier={content_id}"),
-        format!("-XMP:ContentIdentifier={content_id}"),
-        format!("-EmbeddedVideoFile={}", video_path.to_string_lossy()),
-        photo_path.to_string_lossy().to_string(),
-    ];
-
-    run_exiftool(&args)?;
-    Ok(())
-}
-
-fn build_content_identifier(photo_path: &Path, video_path: &Path, prefix: &str) -> String {
-    let photo_name = photo_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("photo")
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect::<String>();
-    let video_name = video_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("video")
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect::<String>();
-    let pair = format!("{prefix}-{photo_name}-{video_name}");
-    let safe = pair.to_ascii_lowercase();
-    let trimmed = safe.trim_start_matches('-');
-    if trimmed.is_empty() {
-        "takeback-live-photo".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn run_exiftool(args: &[String]) -> Result<(), String> {
-    if !has_exiftool() {
-        return Ok(());
-    }
-
-    let status = Command::new("exiftool")
-        .args(args)
-        .status()
-        .map_err(|err| format!("run exiftool: {err}"))?;
-
-    if !status.success() {
-        return Err("exiftool failed while preparing a live photo pair".to_string());
-    }
-
-    Ok(())
-}
-
-fn has_exiftool() -> bool {
-    Command::new("exiftool")
-        .arg("-ver")
-        .output()
-        .map(|result| result.status.success())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -171,6 +92,10 @@ mod tests {
         assert_eq!(LiveStyle::default(), LiveStyle::Separate);
         assert_eq!(LiveStyle::from("iphone"), LiveStyle::Iphone);
         assert_eq!(LiveStyle::from("android"), LiveStyle::Android);
+        assert_eq!(LiveStyle::from("iphonePair"), LiveStyle::Iphone);
+        assert_eq!(LiveStyle::from("androidMotionPhoto"), LiveStyle::Android);
+        assert_eq!(LiveStyle::Iphone.as_str(), "iphonePair");
+        assert_eq!(LiveStyle::Android.as_str(), "androidMotionPhoto");
     }
 
     #[test]

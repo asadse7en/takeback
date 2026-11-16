@@ -33,6 +33,7 @@ const defaultSettings: Settings = {
 type SettingsStore = {
   settings: Settings;
   updateSettings: (patch: Partial<Settings>) => void;
+  replaceSettings: (settings: Settings) => void;
   setOutputFolder: (path: string | null) => void;
   reset: () => void;
 };
@@ -43,6 +44,7 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
     set((state) => ({
       settings: { ...state.settings, ...patch },
     })),
+  replaceSettings: (settings) => set({ settings }),
   setOutputFolder: (path) =>
     set((state) => ({
       settings: { ...state.settings, outputFolder: path },

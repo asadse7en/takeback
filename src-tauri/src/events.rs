@@ -15,6 +15,7 @@ pub struct ProcessingProgressEvent {
     pub total_bytes: u64,
     pub bytes_per_second: f64,
     pub eta_seconds: Option<u64>,
+    pub warnings_count: u64,
     pub warnings: Vec<String>,
 }
 
@@ -60,5 +61,6 @@ mod tests {
         assert!(value.get("processedBytes").is_some());
         assert!(value.get("bytesPerSecond").is_some());
         assert!(value.get("etaSeconds").is_some());
+        assert!(value.get("warningsCount").is_some());
     }
 }

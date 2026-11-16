@@ -41,11 +41,17 @@ pub struct AddSourcesResult {
 pub struct IndexedEntry {
     pub archive_path: String,
     pub path: String,
+    #[serde(default)]
+    pub entry_path: String,
     pub size: u64,
     pub entry_type: EntryType,
     pub album: Option<String>,
     pub trashed: bool,
     pub archived: bool,
+    #[serde(default)]
+    pub embedded_motion_video: bool,
+    #[serde(default)]
+    pub video_duration_seconds: Option<f64>,
     pub sidecar_archive_path: Option<String>,
     pub sidecar_path: Option<String>,
     pub sidecar_match: Option<String>,

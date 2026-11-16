@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 
 pub use crate::metadata::TakeoutMetadata as JsonFields;
 
@@ -64,6 +64,46 @@ pub struct SidecarMatch {
     pub archive_path: String,
     pub path: String,
     pub reason: MatchReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LiveMediaKind {
+    Photo,
+    Video,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LivePhotoCandidate {
+    pub path: String,
+    pub kind: LiveMediaKind,
+    pub taken_timestamp: Option<i64>,
+    pub duration_seconds: Option<f64>,
+    pub embedded_video_verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LivePhotoPair {
+    pub photo_path: String,
+    pub video_path: String,
+    pub content_identifier: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LivePairWarning {
+    pub paths: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LivePhotoDetection {
+    pub pairs: Vec<LivePhotoPair>,
+    pub embedded_motion_photos: Vec<String>,
+    pub warnings: Vec<LivePairWarning>,
 }
 
 #[derive(Debug, Default)]
@@ -307,7 +347,7 @@ fn read_sidecar_json(path: &str) -> Option<(String, JsonFields)> {
     Some((path.to_string(), fields))
 }
 
-fn is_edited_path(path: &str) -> bool {
+pub fn is_edited_path(path: &str) -> bool {
     let name = path.to_lowercase();
     for suffix in EDITED_SUFFIXES {
         if name.contains(suffix) {
@@ -315,6 +355,189 @@ fn is_edited_path(path: &str) -> bool {
         }
     }
     false
+}
+
+pub fn is_android_motion_photo_path(path: &str) -> bool {
+    let filename = path.replace('\\', "/");
+    let filename = filename.rsplit('/').next().unwrap_or(&filename);
+    let filename = filename.to_ascii_lowercase();
+    filename.ends_with(".mp.jpg")
+        || filename.ends_with(".mp.jpeg")
+        || filename.ends_with(".mp.heic")
+}
+
+pub fn verify_android_motion_photo(mut reader: impl Read) -> Result<bool, String> {
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut carry = Vec::new();
+    let mut has_motion_xmp = false;
+    let mut has_mp4 = false;
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("read possible Android Motion Photo: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        carry.extend_from_slice(&buffer[..count]);
+        let lowered = carry.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+        has_motion_xmp |=
+            contains_bytes(&lowered, b"microvideo") || contains_bytes(&lowered, b"motionphoto");
+        has_mp4 |= contains_bytes(&lowered, b"ftyp");
+        if has_motion_xmp && has_mp4 {
+            return Ok(true);
+        }
+        let retain_from = carry.len().saturating_sub(32);
+        carry.drain(..retain_from);
+    }
+    Ok(false)
+}
+
+pub fn read_video_duration_seconds(mut reader: impl Read) -> Result<Option<f64>, String> {
+    loop {
+        let Some((kind, atom_size, header_size)) = read_atom_header(&mut reader)? else {
+            return Ok(None);
+        };
+        if atom_size < header_size {
+            return Ok(None);
+        }
+        let payload_size = atom_size - header_size;
+        if &kind == b"moov" {
+            return read_movie_header(&mut reader, payload_size);
+        }
+        if !skip_bytes(&mut reader, payload_size)? {
+            return Ok(None);
+        }
+    }
+}
+
+fn read_movie_header(reader: &mut impl Read, mut remaining: u64) -> Result<Option<f64>, String> {
+    while remaining >= 8 {
+        let Some((kind, atom_size, header_size)) = read_atom_header(reader)? else {
+            return Ok(None);
+        };
+        if atom_size < header_size || atom_size > remaining {
+            return Ok(None);
+        }
+        let payload_size = atom_size - header_size;
+        if &kind == b"mvhd" {
+            return read_mvhd_duration(reader, payload_size);
+        }
+        if !skip_bytes(reader, payload_size)? {
+            return Ok(None);
+        }
+        remaining -= atom_size;
+    }
+    Ok(None)
+}
+
+fn read_atom_header(reader: &mut impl Read) -> Result<Option<([u8; 4], u64, u64)>, String> {
+    let mut header = [0_u8; 8];
+    match reader.read(&mut header[..1]) {
+        Ok(0) => return Ok(None),
+        Ok(_) => {}
+        Err(error) => return Err(format!("read video atom header: {error}")),
+    }
+    if !read_exact_or_incomplete(reader, &mut header[1..], "read video atom header")? {
+        return Ok(None);
+    }
+    let size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
+    let mut kind = [0_u8; 4];
+    kind.copy_from_slice(&header[4..8]);
+    if size == 1 {
+        let mut extended = [0_u8; 8];
+        if !read_exact_or_incomplete(reader, &mut extended, "read extended video atom header")? {
+            return Ok(None);
+        }
+        Ok(Some((kind, u64::from_be_bytes(extended), 16)))
+    } else if size == 0 {
+        Ok(Some((kind, u64::MAX, 8)))
+    } else {
+        Ok(Some((kind, size, 8)))
+    }
+}
+
+fn read_mvhd_duration(reader: &mut impl Read, payload_size: u64) -> Result<Option<f64>, String> {
+    let mut fixed = [0_u8; 4];
+    if payload_size < fixed.len() as u64 {
+        return Ok(None);
+    }
+    if !read_exact_or_incomplete(reader, &mut fixed, "read video movie header")? {
+        return Ok(None);
+    }
+    let mut remaining = payload_size - 4;
+    let (creation_size, duration_size) = match fixed[0] {
+        0 => (4_u64, 4_u64),
+        1 => (8_u64, 8_u64),
+        _ => return Ok(None),
+    };
+    let required = creation_size * 2 + 4 + duration_size;
+    if remaining < required {
+        return Ok(None);
+    }
+    if !skip_bytes(reader, creation_size * 2)? {
+        return Ok(None);
+    }
+    remaining -= creation_size * 2;
+    let mut timescale = [0_u8; 4];
+    if !read_exact_or_incomplete(reader, &mut timescale, "read video timescale")? {
+        return Ok(None);
+    }
+    let timescale = u32::from_be_bytes(timescale) as f64;
+    remaining -= 4;
+    let mut duration = [0_u8; 8];
+    let duration = if duration_size == 4 {
+        if !read_exact_or_incomplete(reader, &mut duration[4..], "read video duration")? {
+            return Ok(None);
+        }
+        u32::from_be_bytes([duration[4], duration[5], duration[6], duration[7]]) as f64
+    } else {
+        if !read_exact_or_incomplete(reader, &mut duration, "read video duration")? {
+            return Ok(None);
+        }
+        u64::from_be_bytes(duration) as f64
+    };
+    remaining -= duration_size;
+    if remaining > 0 && !skip_bytes(reader, remaining)? {
+        return Ok(None);
+    }
+    if timescale == 0.0 {
+        Ok(None)
+    } else {
+        Ok(Some(duration / timescale))
+    }
+}
+
+fn read_exact_or_incomplete(
+    reader: &mut impl Read,
+    buffer: &mut [u8],
+    operation: &str,
+) -> Result<bool, String> {
+    match reader.read_exact(buffer) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(format!("{operation}: {error}")),
+    }
+}
+
+fn skip_bytes(reader: &mut impl Read, mut count: u64) -> Result<bool, String> {
+    let mut buffer = [0_u8; 16 * 1024];
+    while count > 0 {
+        let requested = buffer.len().min(count.min(buffer.len() as u64) as usize);
+        let read = reader
+            .read(&mut buffer[..requested])
+            .map_err(|error| format!("skip video data: {error}"))?;
+        if read == 0 {
+            return Ok(false);
+        }
+        count -= read as u64;
+    }
+    Ok(true)
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 pub fn album_membership(path: &str) -> Vec<String> {
@@ -352,41 +575,200 @@ pub fn album_membership(path: &str) -> Vec<String> {
     }
 }
 
-fn detect_live_pairs(media_paths: &[String]) -> std::collections::HashSet<String> {
-    let mut by_basename: HashMap<String, Vec<String>> = HashMap::new();
+pub fn detect_live_pairs(media_paths: &[String]) -> std::collections::HashSet<String> {
+    let mut by_location: HashMap<String, Vec<(String, bool)>> = HashMap::new();
     for item in media_paths {
         let path = item.replace('\\', "/");
         let file_name = path.rsplit('/').next().unwrap_or(&path);
-        let base = file_name
-            .rsplit_once('.')
-            .map(|(stem, _)| stem)
-            .unwrap_or(file_name);
-        by_basename
-            .entry(base.to_ascii_lowercase())
+        let lower_name = file_name.to_ascii_lowercase();
+        let Some((base, extension)) = lower_name.rsplit_once('.') else {
+            continue;
+        };
+        let is_photo = matches!(extension, "jpg" | "jpeg" | "heic" | "heif" | "png");
+        let is_video = matches!(extension, "mp4" | "mov" | "m4v");
+        if !is_photo && !is_video {
+            continue;
+        }
+        let base = base.strip_suffix(".mp").unwrap_or(base);
+        let parent = path
+            .rsplit_once('/')
+            .map_or_else(String::new, |(parent, _)| parent.to_ascii_lowercase());
+        by_location
+            .entry(format!("{parent}/{base}"))
             .or_default()
-            .push(item.clone());
+            .push((item.clone(), is_video));
     }
 
     let mut live = std::collections::HashSet::new();
-    for items in by_basename.values() {
-        let has_video = items.iter().any(|item| {
-            let lower = item.to_ascii_lowercase();
-            lower.ends_with(".mp4") || lower.ends_with(".mov") || lower.ends_with(".m4v")
-        });
-        let has_photo = items.iter().any(|item| {
-            let lower = item.to_ascii_lowercase();
-            lower.ends_with(".jpg")
-                || lower.ends_with(".jpeg")
-                || lower.ends_with(".heic")
-                || lower.ends_with(".png")
-        });
-        if has_video && has_photo {
-            for item in items {
-                live.insert(item.clone());
+    for items in by_location.values() {
+        let photos = items.iter().filter(|(_, is_video)| !is_video).count();
+        let videos = items.iter().filter(|(_, is_video)| *is_video).count();
+        if photos == 1 && videos == 1 {
+            for (path, _) in items {
+                live.insert(path.clone());
             }
         }
     }
     live
+}
+
+pub fn match_live_photos(candidates: &[LivePhotoCandidate]) -> LivePhotoDetection {
+    let mut detection = LivePhotoDetection::default();
+    let mut grouped: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut by_base: HashMap<String, Vec<usize>> = HashMap::new();
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        if is_android_motion_photo_path(&candidate.path) {
+            if candidate.embedded_video_verified {
+                detection
+                    .embedded_motion_photos
+                    .push(candidate.path.clone());
+            } else {
+                detection.warnings.push(LivePairWarning {
+                    paths: vec![candidate.path.clone()],
+                    message: format!(
+                        "Could not verify the embedded video in {}; kept the file separate.",
+                        candidate.path
+                    ),
+                });
+            }
+            continue;
+        }
+
+        let (parent, base) = live_path_key(&candidate.path);
+        grouped
+            .entry(format!("{parent}/{base}"))
+            .or_default()
+            .push(index);
+        by_base.entry(base).or_default().push(index);
+    }
+
+    let mut paired_paths = std::collections::HashSet::new();
+    for indices in grouped.values() {
+        let photos = indices
+            .iter()
+            .copied()
+            .filter(|index| candidates[*index].kind == LiveMediaKind::Photo)
+            .collect::<Vec<_>>();
+        let videos = indices
+            .iter()
+            .copied()
+            .filter(|index| candidates[*index].kind == LiveMediaKind::Video)
+            .collect::<Vec<_>>();
+        if photos.is_empty() || videos.is_empty() {
+            continue;
+        }
+        if photos.len() != 1 || videos.len() != 1 {
+            let paths = indices
+                .iter()
+                .map(|index| candidates[*index].path.clone())
+                .collect();
+            detection.warnings.push(LivePairWarning {
+                paths,
+                message: "More than one image or video matched this live photo name; kept all files separate.".to_string(),
+            });
+            continue;
+        }
+
+        let photo = &candidates[photos[0]];
+        let video = &candidates[videos[0]];
+        let (Some(photo_time), Some(video_time)) = (photo.taken_timestamp, video.taken_timestamp)
+        else {
+            detection.warnings.push(LivePairWarning {
+                paths: vec![photo.path.clone(), video.path.clone()],
+                message: "A live photo name matched, but capture times were unavailable; kept both files separate.".to_string(),
+            });
+            continue;
+        };
+        if photo_time.abs_diff(video_time) > 2 {
+            detection.warnings.push(LivePairWarning {
+                paths: vec![photo.path.clone(), video.path.clone()],
+                message: "A live photo name matched, but capture times differ by more than two seconds; kept both files separate.".to_string(),
+            });
+            continue;
+        }
+        let Some(duration) = video.duration_seconds else {
+            detection.warnings.push(LivePairWarning {
+                paths: vec![photo.path.clone(), video.path.clone()],
+                message: "A live photo name matched, but video duration could not be verified; kept both files separate.".to_string(),
+            });
+            continue;
+        };
+        if duration > 10.0 {
+            detection.warnings.push(LivePairWarning {
+                paths: vec![photo.path.clone(), video.path.clone()],
+                message: "A matching video is longer than a typical live photo; kept both files separate.".to_string(),
+            });
+            continue;
+        }
+
+        let content_identifier = content_identifier(&photo.path, &video.path);
+        detection.pairs.push(LivePhotoPair {
+            photo_path: photo.path.clone(),
+            video_path: video.path.clone(),
+            content_identifier,
+        });
+        paired_paths.insert(photo.path.as_str());
+        paired_paths.insert(video.path.as_str());
+    }
+
+    for indices in by_base.values() {
+        if indices
+            .iter()
+            .any(|index| paired_paths.contains(candidates[*index].path.as_str()))
+        {
+            continue;
+        }
+        let has_photo = indices
+            .iter()
+            .any(|index| candidates[*index].kind == LiveMediaKind::Photo);
+        let has_video = indices
+            .iter()
+            .any(|index| candidates[*index].kind == LiveMediaKind::Video);
+        if has_photo && has_video {
+            let paths = indices
+                .iter()
+                .map(|index| candidates[*index].path.clone())
+                .collect();
+            if !detection
+                .warnings
+                .iter()
+                .any(|warning| warning.paths == paths)
+            {
+                detection.warnings.push(LivePairWarning {
+                    paths,
+                    message: "Matching live photo names were found in different folders; kept all files separate.".to_string(),
+                });
+            }
+        }
+    }
+
+    detection
+}
+
+fn live_path_key(path: &str) -> (String, String) {
+    let normalized = path.replace('\\', "/");
+    let filename = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let lower = filename.to_ascii_lowercase();
+    let (stem, _) = lower.rsplit_once('.').unwrap_or((&lower, ""));
+    let stem = stem.strip_suffix(".mp").unwrap_or(stem);
+    let parent = normalized
+        .rsplit_once('/')
+        .map_or_else(String::new, |(parent, _)| parent.to_ascii_lowercase());
+    (parent, stem.to_string())
+}
+
+fn content_identifier(photo_path: &str, video_path: &str) -> String {
+    let digest = blake3::hash(format!("{photo_path}\0{video_path}").as_bytes()).to_hex();
+    let hex = digest.as_str();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 #[cfg(test)]

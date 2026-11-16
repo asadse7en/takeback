@@ -45,10 +45,22 @@ export type RunState = {
   recentFiles: string[];
   warnings: string[];
   lastEventAt: number | null;
+  processedBytes: number;
+  totalBytes: number;
+  bytesPerSecond: number;
+  etaSeconds: number | null;
+  warningsCount: number;
 };
 
 export type ScanState = {
   files: string[];
+  sources: {
+    id: string;
+    path: string;
+    archiveType: 'zip' | 'tgz' | 'folder';
+    sizeBytes: number;
+    entryCount: number;
+  }[];
   counts: {
     photos: number;
     videos: number;

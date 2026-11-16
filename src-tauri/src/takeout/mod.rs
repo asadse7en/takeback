@@ -240,6 +240,8 @@ impl TempIndex {
                 album TEXT,
                 trashed INTEGER NOT NULL,
                 archived INTEGER NOT NULL,
+                embedded_motion_video INTEGER NOT NULL,
+                video_duration_seconds REAL,
                 metadata_json TEXT,
                 sidecar_archive_path TEXT,
                 sidecar_path TEXT,
@@ -262,6 +264,8 @@ impl TempIndex {
         album: Option<&str>,
         trashed: bool,
         archived: bool,
+        embedded_motion_video: bool,
+        video_duration_seconds: Option<f64>,
         metadata: Option<&crate::metadata::TakeoutMetadata>,
     ) -> Result<(), String> {
         let size = i64::try_from(entry.size)
@@ -269,8 +273,9 @@ impl TempIndex {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO entries (
-                archive_path, path, entry_path, size, kind, album, trashed, archived, metadata_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                archive_path, path, entry_path, size, kind, album, trashed, archived,
+                embedded_motion_video, video_duration_seconds, metadata_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 (
                     archive_path,
                     &entry.path,
@@ -280,6 +285,8 @@ impl TempIndex {
                     album,
                     trashed,
                     archived,
+                    embedded_motion_video,
+                    video_duration_seconds,
                     metadata
                         .map(serde_json::to_string)
                         .transpose()
@@ -318,48 +325,80 @@ impl TempIndex {
     }
 
     pub fn entries(&self) -> Result<Vec<IndexedEntry>, String> {
+        self.entries_limited(None, false)
+    }
+
+    pub fn media_entries(&self) -> Result<Vec<IndexedEntry>, String> {
+        self.entries_limited(None, true)
+    }
+
+    pub fn preview_entries(&self, limit: usize) -> Result<Vec<IndexedEntry>, String> {
+        self.entries_limited(Some(limit), true)
+    }
+
+    fn entries_limited(
+        &self,
+        limit: Option<usize>,
+        media_only: bool,
+    ) -> Result<Vec<IndexedEntry>, String> {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT entry.archive_path, entry.path, entry.size, entry.kind, entry.album,
-                        entry.trashed, entry.archived, entry.sidecar_archive_path,
-                        entry.sidecar_path, entry.sidecar_match, sidecar.metadata_json
+                "SELECT entry.archive_path, entry.path, entry.entry_path, entry.size, entry.kind, entry.album,
+                        entry.trashed, entry.archived, entry.embedded_motion_video,
+                        entry.video_duration_seconds,
+                        entry.sidecar_archive_path, entry.sidecar_path, entry.sidecar_match,
+                        sidecar.metadata_json
                  FROM entries AS entry
                  LEFT JOIN entries AS sidecar
                    ON sidecar.archive_path = entry.sidecar_archive_path
                   AND sidecar.path = entry.sidecar_path
-                 ORDER BY entry.archive_path, entry.path",
+                 WHERE (?2 = 0 OR entry.kind IN ('photo', 'video'))
+                 ORDER BY entry.archive_path, entry.path
+                 LIMIT COALESCE(?1, -1)",
             )
             .map_err(|e| format!("prepare archive index read: {e}"))?;
         let rows = statement
-            .query_map([], |row| {
-                let kind: String = row.get(3)?;
-                let size: i64 = row.get(2)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    size,
-                    kind,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, bool>(5)?,
-                    row.get::<_, bool>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                    row.get::<_, Option<String>>(10)?,
-                ))
-            })
+            .query_map(
+                [
+                    limit.map(|value| value.min(i64::MAX as usize) as i64),
+                    Some(i64::from(media_only)),
+                ],
+                |row| {
+                    let kind: String = row.get(4)?;
+                    let size: i64 = row.get(3)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        size,
+                        kind,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, bool>(6)?,
+                        row.get::<_, bool>(7)?,
+                        row.get::<_, bool>(8)?,
+                        row.get::<_, Option<f64>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                    ))
+                },
+            )
             .map_err(|e| format!("query archive index: {e}"))?;
         let mut entries = Vec::new();
         for row in rows {
             let (
                 archive_path,
                 path,
+                entry_path,
                 size,
                 kind,
                 album,
                 trashed,
                 archived,
+                embedded_motion_video,
+                video_duration_seconds,
                 sidecar_archive_path,
                 sidecar_path,
                 sidecar_match,
@@ -376,11 +415,14 @@ impl TempIndex {
             entries.push(IndexedEntry {
                 archive_path,
                 path,
+                entry_path,
                 size,
                 entry_type,
                 album,
                 trashed: trashed || metadata.as_ref().is_some_and(|fields| fields.trashed),
                 archived: archived || metadata.as_ref().is_some_and(|fields| fields.archived),
+                embedded_motion_video,
+                video_duration_seconds,
                 sidecar_archive_path,
                 sidecar_path,
                 sidecar_match,
@@ -447,6 +489,10 @@ pub fn index_sources(paths: &[String]) -> Result<TempIndex, String> {
     index_expanded_sources(&expanded_paths)
 }
 
+pub fn index_explicit_sources(paths: &[String]) -> Result<TempIndex, String> {
+    index_expanded_sources(paths)
+}
+
 fn index_expanded_sources(paths: &[String]) -> Result<TempIndex, String> {
     let index = TempIndex::new()?;
     let mut media_refs = Vec::new();
@@ -459,7 +505,17 @@ fn index_expanded_sources(paths: &[String]) -> Result<TempIndex, String> {
         let archive_path = source_path.to_string_lossy().to_string();
         source.visit_entries(&mut |entry, reader| {
             let metadata = if entry.entry_type == EntryType::JsonSidecar {
-                Some(crate::metadata::TakeoutMetadata::from_reader(reader)?)
+                Some(crate::metadata::TakeoutMetadata::from_reader(&mut *reader)?)
+            } else {
+                None
+            };
+            let embedded_motion_video = if matcher::is_android_motion_photo_path(&entry.path) {
+                matcher::verify_android_motion_photo(&mut *reader)?
+            } else {
+                false
+            };
+            let video_duration_seconds = if entry.entry_type == EntryType::Video {
+                matcher::read_video_duration_seconds(&mut *reader)?
             } else {
                 None
             };
@@ -470,6 +526,8 @@ fn index_expanded_sources(paths: &[String]) -> Result<TempIndex, String> {
                 album.as_deref(),
                 trashed,
                 archived,
+                embedded_motion_video,
+                video_duration_seconds,
                 metadata.as_ref(),
             )?;
             match entry.entry_type {
@@ -792,6 +850,10 @@ pub fn detect_numbering_gap_from_names(names: &[String]) -> Vec<u32> {
 }
 
 pub fn scan_paths(paths: &[String]) -> Result<ScanSourcesResult, String> {
+    scan_paths_with_index(paths).map(|(result, _)| result)
+}
+
+pub fn scan_paths_with_index(paths: &[String]) -> Result<(ScanSourcesResult, TempIndex), String> {
     let expanded_paths = expand_source_paths(paths)?;
     let index = index_expanded_sources(&expanded_paths)?;
     let counts = index.counts()?;
@@ -802,11 +864,14 @@ pub fn scan_paths(paths: &[String]) -> Result<ScanSourcesResult, String> {
     if let Some(root) = index.google_photos_root()? {
         warnings.push(format!("Detected Google Photos folder: {root}"));
     }
-    Ok(ScanSourcesResult {
-        files: expanded_paths,
-        counts,
-        warnings,
-    })
+    Ok((
+        ScanSourcesResult {
+            files: expanded_paths,
+            counts,
+            warnings,
+        },
+        index,
+    ))
 }
 
 pub fn create_source(path: &Path) -> Result<Box<dyn Source>, String> {
@@ -1098,12 +1163,17 @@ mod tests {
         ])
         .unwrap();
         let entries = index.entries().unwrap();
+        let preview_entries = index.preview_entries(2).unwrap();
         let media: Vec<_> = entries
             .iter()
             .filter(|entry| entry.entry_type == EntryType::Photo)
             .collect();
 
         assert_eq!(media.len(), media_entries.len());
+        assert_eq!(preview_entries.len(), 2);
+        assert!(preview_entries
+            .iter()
+            .all(|entry| matches!(entry.entry_type, EntryType::Photo | EntryType::Video)));
         assert!(media
             .iter()
             .all(|entry| entry.sidecar_archive_path.as_deref()
@@ -1153,6 +1223,65 @@ mod tests {
             entry.path.ends_with("IMG_4-edited.jpg")
                 && entry.sidecar_match.as_deref() == Some("EditedSuffixStripped")
         }));
+    }
+
+    #[test]
+    fn explicit_source_index_does_not_reexpand_removed_archive_parts() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("takeout-20240612T101500Z-001.zip");
+        let second = dir.path().join("takeout-20240612T101500Z-002.zip");
+        create_zip(&first, &[("Photos/first.jpg", b"first")]);
+        create_zip(&second, &[("Photos/second.jpg", b"second")]);
+
+        let index = index_explicit_sources(&[second.to_string_lossy().to_string()]).unwrap();
+        let entries = index.media_entries().unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].archive_path,
+            second.to_string_lossy().to_string()
+        );
+    }
+
+    #[test]
+    fn archive_index_persists_motion_photo_verification_and_video_duration() {
+        fn atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
+            bytes.extend_from_slice(kind);
+            bytes.extend_from_slice(payload);
+            bytes
+        }
+
+        let dir = tempdir().unwrap();
+        let archive_path = dir.path().join("live-photos.zip");
+        let mut movie_header = vec![0, 0, 0, 0];
+        movie_header.extend_from_slice(&0_u32.to_be_bytes());
+        movie_header.extend_from_slice(&0_u32.to_be_bytes());
+        movie_header.extend_from_slice(&1_000_u32.to_be_bytes());
+        movie_header.extend_from_slice(&2_500_u32.to_be_bytes());
+        let movie = atom(b"moov", &atom(b"mvhd", &movie_header));
+        let motion_photo = b"<x:xmpmeta>GCamera:MicroVideo</x:xmpmeta>ftypisom";
+        create_zip(
+            &archive_path,
+            &[
+                ("Photos/IMG_1.MP.jpg", motion_photo),
+                ("Photos/IMG_2.mov", &movie),
+            ],
+        );
+
+        let index = index_sources(&[archive_path.to_string_lossy().to_string()]).unwrap();
+        let entries = index.media_entries().unwrap();
+        let motion = entries
+            .iter()
+            .find(|entry| entry.path.ends_with("IMG_1.MP.jpg"))
+            .unwrap();
+        assert!(motion.embedded_motion_video);
+        let video = entries
+            .iter()
+            .find(|entry| entry.path.ends_with("IMG_2.mov"))
+            .unwrap();
+        assert_eq!(video.video_duration_seconds, Some(2.5));
     }
 
     #[test]

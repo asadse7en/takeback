@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import type { RunState } from '@/types/app';
+import type { ProcessingProgress } from '@/lib/api';
 
 const initialRunState: RunState = {
   completed: 0,
@@ -11,45 +12,59 @@ const initialRunState: RunState = {
   recentFiles: [],
   warnings: [],
   lastEventAt: null,
+  processedBytes: 0,
+  totalBytes: 0,
+  bytesPerSecond: 0,
+  etaSeconds: null,
+  warningsCount: 0,
 };
 
 type RunStore = {
   run: RunState;
-  setProgress: (completed: number, total: number, status?: string, file?: string) => void;
+  claimed: boolean;
+  setProgress: (progress: ProcessingProgress) => void;
   setStatus: (status: string) => void;
+  claimStart: () => boolean;
   reset: () => void;
 };
 
 export const useRunStore = create<RunStore>((set) => ({
   run: initialRunState,
-  setProgress: (completed, total, status = 'Running', file = '') =>
+  claimed: false,
+  setProgress: (progress) =>
     set((state) => {
-      const now = Date.now();
-      const completedDelta = Math.max(0, completed - state.run.completed);
-      const elapsedSeconds = state.run.lastEventAt === null ? 0 : (now - state.run.lastEventAt) / 1000;
-      const sample = elapsedSeconds > 0 ? completedDelta / elapsedSeconds : 0;
-      const speedSamples = completedDelta > 0 ? [...state.run.speedSamples, sample].slice(-5) : state.run.speedSamples;
-      const recentFiles = completedDelta > 0 && file
-        ? [file, ...state.run.recentFiles.filter((recentFile) => recentFile !== file)].slice(0, 5)
+      const currentFile = progress.currentFile ?? state.run.currentFile;
+      const recentFiles = progress.currentFile
+        ? [progress.currentFile, ...state.run.recentFiles.filter((file) => file !== progress.currentFile)].slice(0, 5)
         : state.run.recentFiles;
-      const warnings = /warn|error|skip/i.test(status) && file
-        ? [...state.run.warnings, `${file}: ${status}`]
-        : state.run.warnings;
       return {
         run: {
           ...state.run,
-          completed,
-          total,
-          percent: total ? Math.round((completed / total) * 100) : 0,
-          status,
-          currentFile: file || state.run.currentFile,
-          speedSamples,
+          completed: progress.completedFiles,
+          total: progress.totalFiles,
+          percent: progress.totalFiles ? Math.round((progress.completedFiles / progress.totalFiles) * 100) : 0,
+          status: 'Running',
+          currentFile,
           recentFiles,
-          warnings,
-          lastEventAt: now,
+          warnings: progress.warnings,
+          processedBytes: progress.processedBytes,
+          totalBytes: progress.totalBytes,
+          bytesPerSecond: progress.bytesPerSecond,
+          etaSeconds: progress.etaSeconds,
+          warningsCount: progress.warningsCount,
+          lastEventAt: Date.now(),
         },
       };
     }),
   setStatus: (status) => set((state) => ({ run: { ...state.run, status } })),
-  reset: () => set({ run: initialRunState }),
+  claimStart: () => {
+    let claimed = false;
+    set((state) => {
+      if (state.claimed) return state;
+      claimed = true;
+      return { ...state, claimed: true };
+    });
+    return claimed;
+  },
+  reset: () => set({ run: initialRunState, claimed: false }),
 }));

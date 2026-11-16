@@ -1,0 +1,107 @@
+[
+  {
+    "path": "Photos/IMG_100.jpg",
+    "kind": "photo",
+    "takenTimestamp": 1710000000,
+    "durationSeconds": null,
+    "embeddedVideoVerified": false
+  },
+  {
+    "path": "Photos/IMG_100.mov",
+    "kind": "video",
+    "takenTimestamp": 1710000001,
+    "durationSeconds": 2.4,
+    "embeddedVideoVerified": false
+  },
+  {
+    "path": "Photos/IMG_200.jpg",
+    "kind": "photo",
+    "takenTimestamp": 1710000000,
+    "durationSeconds": null,
+    "embeddedVideoVerified": false
+  },
+  {
+    "path": "Photos/IMG_200.png",
+    "kind": "photo",
+    "takenTimestamp": 1710000000,
+    "durationSeconds": null,
+    "embeddedVideoVerified": false
+  },
+  {
+    "path": "Photos/IMG_200.mp4",
+    "kind": "video",
+    "takenTimestamp": 1710000001,
+    "durationSeconds": 2.0,
+    "embeddedVideoVerified": false
+  },
+  {
+    "path": "Album A/IMG_300.jpg",
+    "kind": "photo",
+    "takenTimestamp": 1710000000,
+    "durationSeconds": null,
+    "embeddedVideoVerified": false
+  },
+  {
+    "path": "Album B/IMG_300.mp4",
+    "kind": "video",
+    "takenTimestamp": 1710000000,
+    "durationSeconds": 2.0,
+    "embeddedVideoVerified": false
+  },
+  {
+    "path": "Photos/IMG_400.jpg",
+    "kind": "photo",
+    "takenTimestamp": null,
+    "durationSeconds": null,
+    "embeddedVideoVerified": false
+  },
+  {
+    "path": "Photos/IMG_400.mp4",
+    "kind": "video",
+    "takenTimestamp": null,
+    "durationSeconds": null,
+    "embeddedVideoVerified": false
+  },
+  {
+    "path": "Photos/IMG_500.MP.jpg",
+    "kind": "photo",
+    "takenTimestamp": 1710000000,
+    "durationSeconds": null,
+    "embeddedVideoVerified": true
+  },
+  {
+    "path": "Photos/IMG_600.MP.jpg",
+    "kind": "photo",
+    "takenTimestamp": 1710000000,
+    "durationSeconds": null,
+    "embeddedVideoVerified": false
+  },
+  {
+    "path": "Photos/IMG_700.jpg",
+    "kind": "photo",
+    "takenTimestamp": 1710000000,
+    "durationSeconds": null,
+    "embeddedVideoVerified": false
+  },
+  {
+    "path": "Photos/IMG_700.mp4",
+    "kind": "video",
+    "takenTimestamp": 1710000000,
+    "durationSeconds": null,
+    "embeddedVideoVerified": false
+  },
+  {
+    "path": "Photos/IMG_800.jpg",
+    "kind": "photo",
+    "takenTimestamp": 1710000000,
+    "durationSeconds": null,
+    "embeddedVideoVerified": false
+  },
+  {
+    "path": "Photos/IMG_800.mp4",
+    "kind": "video",
+    "takenTimestamp": 1710000000,
+    "durationSeconds": 20.0,
+    "embeddedVideoVerified": false
+  }
+]

@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::SystemTime;
 
-use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
+use chrono::{DateTime, FixedOffset, Local, Offset, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::OnceLock;
@@ -262,6 +262,87 @@ impl ExifTool {
         let mut warnings = tool_warnings(&output);
         warnings.extend(self.set_modified_time(path, metadata)?);
         Ok(warnings)
+    }
+
+    pub fn write_live_content_identifier(
+        &mut self,
+        path: &Path,
+        content_identifier: &str,
+    ) -> Result<(), String> {
+        let path = path
+            .to_str()
+            .ok_or_else(|| format!("file path is not valid Unicode: {}", path.display()))?;
+        if content_identifier.contains('\n') || content_identifier.contains('\r') {
+            return Err("live photo content identifier contains a line break".to_string());
+        }
+        self.execute(&[
+            "-overwrite_original".to_string(),
+            format!("-XMP:ContentIdentifier={content_identifier}"),
+            format!("-ContentIdentifier={content_identifier}"),
+            path.to_string(),
+        ])?;
+        Ok(())
+    }
+
+    pub fn read_taken_timestamp(&mut self, path: &Path) -> Result<Option<i64>, String> {
+        let path = path
+            .to_str()
+            .ok_or_else(|| format!("file path is not valid Unicode: {}", path.display()))?;
+        let output = self.execute(&[
+            "-s".to_string(),
+            "-s".to_string(),
+            "-s".to_string(),
+            "-DateTimeOriginal".to_string(),
+            "-CreateDate".to_string(),
+            "-MediaCreateDate".to_string(),
+            "-TrackCreateDate".to_string(),
+            path.to_string(),
+        ])?;
+        for value in output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            if let Ok(datetime) = DateTime::parse_from_str(value, "%Y:%m:%d %H:%M:%S%:z") {
+                return Ok(Some(datetime.timestamp()));
+            }
+            if let Ok(timestamp) = chrono::NaiveDateTime::parse_from_str(value, "%Y:%m:%d %H:%M:%S")
+            {
+                if let Some(datetime) = Local.from_local_datetime(&timestamp).single() {
+                    return Ok(Some(datetime.timestamp()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn embed_motion_video(
+        &mut self,
+        photo_path: &Path,
+        video_path: &Path,
+        content_identifier: &str,
+    ) -> Result<(), String> {
+        let photo_path = photo_path
+            .to_str()
+            .ok_or_else(|| format!("file path is not valid Unicode: {}", photo_path.display()))?;
+        let video_path = video_path
+            .to_str()
+            .ok_or_else(|| format!("file path is not valid Unicode: {}", video_path.display()))?;
+        if content_identifier.contains('\n') || content_identifier.contains('\r') {
+            return Err("live photo content identifier contains a line break".to_string());
+        }
+        self.execute(&[
+            "-overwrite_original".to_string(),
+            "-XMP-GCamera:MicroVideo=1".to_string(),
+            "-XMP-GCamera:MicroVideoVersion=1".to_string(),
+            "-XMP-GCamera:MotionPhoto=1".to_string(),
+            "-XMP-GCamera:MotionPhotoVersion=1".to_string(),
+            format!("-XMP-GCamera:ContentIdentifier={content_identifier}"),
+            format!("-XMP:ContentIdentifier={content_identifier}"),
+            format!("-EmbeddedVideoFile={video_path}"),
+            photo_path.to_string(),
+        ])?;
+        Ok(())
     }
 
     fn read_original_offset(&mut self, path: &str) -> Result<Option<String>, String> {

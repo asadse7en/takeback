@@ -129,6 +129,7 @@ impl Default for SplitByType {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[serde(default)]
 pub struct Settings {
     pub output_folder: Option<String>,
     pub album_mode: FolderMode,
