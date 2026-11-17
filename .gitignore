@@ -45,6 +45,7 @@ Desktop.ini
 docs/
 !docs/
 docs/*
+!docs/DESIGN.md
 !docs/images/
 docs/images/*
 !docs/images/readme-banner-light-1280x320.png
