@@ -1,3 +1,10 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-banner-dark-1280x320.png">
+  <img alt="Takeback" src="docs/images/readme-banner-light-1280x320.png">
+</picture>
+
+Not affiliated with Google.
+
 # Takeback
 
 Takeback restores dates, locations, descriptions, and favorites from Google

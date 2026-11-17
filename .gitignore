@@ -43,3 +43,9 @@ Desktop.ini
 
 .github/
 docs/
+!docs/
+docs/*
+!docs/images/
+docs/images/*
+!docs/images/readme-banner-light-1280x320.png
+!docs/images/readme-banner-dark-1280x320.png

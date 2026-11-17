@@ -1,6 +1,6 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/schema.json",
-  "productName": "takeback",
+  "productName": "Takeback",
   "version": "0.1.0",
   "identifier": "com.example.takeback",
   "build": {
@@ -37,6 +37,21 @@
     ],
     "resources": [
       "binaries/exiftool"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "headerImage": "installer/windows/nsis-header.bmp",
+        "sidebarImage": "installer/windows/nsis-sidebar.bmp"
+      },
+      "wix": {
+        "bannerPath": "installer/windows/wix-banner.bmp",
+        "dialogImagePath": "installer/windows/wix-dialog.bmp"
+      }
+    },
+    "macOS": {
+      "dmg": {
+        "background": "installer/macos/dmg-background.png"
+      }
+    }
   }
 }
