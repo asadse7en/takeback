@@ -54,9 +54,12 @@ pub trait Source: Send + Sync {
         &self,
         visitor: &mut dyn FnMut(&SourceEntry, &mut dyn Read) -> Result<(), String>,
         cancelled: Option<&AtomicBool>,
+        on_invalid_path: &mut dyn FnMut(&str, &str) -> Result<(), String>,
     ) -> Result<(), String>;
 
     fn copy_entry_to(&self, entry_path: &str, output: &mut dyn Write) -> Result<u64, String>;
+
+    fn hash_entry_prefix(&self, entry_path: &str) -> Result<blake3::Hash, String>;
 
     fn read_video_duration_seconds(&self, entry_path: &str) -> Result<Option<f64>, String>;
 
@@ -68,6 +71,9 @@ pub trait Source: Send + Sync {
                 Ok(())
             },
             None,
+            &mut |entry_path, error| {
+                Err(format!("invalid source entry path {entry_path}: {error}"))
+            },
         )?;
         Ok(entries)
     }
@@ -102,6 +108,7 @@ impl Source for ZipSource {
         &self,
         visitor: &mut dyn FnMut(&SourceEntry, &mut dyn Read) -> Result<(), String>,
         cancelled: Option<&AtomicBool>,
+        on_invalid_path: &mut dyn FnMut(&str, &str) -> Result<(), String>,
     ) -> Result<(), String> {
         let file = fs::File::open(&self.path)
             .map_err(|e| format!("open zip {}: {e}", self.path.display()))?;
@@ -117,7 +124,13 @@ impl Source for ZipSource {
                 continue;
             }
             let entry_path = entry.name().to_string();
-            let path = normalize_archive_entry_path(&entry_path)?;
+            let path = match normalize_archive_entry_path(&entry_path) {
+                Ok(path) => path,
+                Err(error) => {
+                    on_invalid_path(&entry_path, &error)?;
+                    continue;
+                }
+            };
             let metadata = SourceEntry {
                 entry_path,
                 entry_type: entry_type_for_path(&path),
@@ -138,6 +151,17 @@ impl Source for ZipSource {
             .by_name(entry_path)
             .map_err(|_| format!("zip entry not found: {entry_path}"))?;
         io::copy(&mut entry, output).map_err(|e| format!("stream zip entry {entry_path}: {e}"))
+    }
+
+    fn hash_entry_prefix(&self, entry_path: &str) -> Result<blake3::Hash, String> {
+        let file = fs::File::open(&self.path)
+            .map_err(|error| format!("open zip {}: {error}", self.path.display()))?;
+        let mut archive = ZipArchive::new(file)
+            .map_err(|error| format!("read zip {}: {error}", self.path.display()))?;
+        let mut entry = archive
+            .by_name(entry_path)
+            .map_err(|error| format!("open entry {entry_path} for duplicate check: {error}"))?;
+        hash_prefix(&mut entry).map_err(|error| format!("hash entry prefix {entry_path}: {error}"))
     }
 
     fn read_video_duration_seconds(&self, entry_path: &str) -> Result<Option<f64>, String> {
@@ -191,6 +215,7 @@ impl Source for TgzSource {
         &self,
         visitor: &mut dyn FnMut(&SourceEntry, &mut dyn Read) -> Result<(), String>,
         cancelled: Option<&AtomicBool>,
+        on_invalid_path: &mut dyn FnMut(&str, &str) -> Result<(), String>,
     ) -> Result<(), String> {
         let file = fs::File::open(&self.path)
             .map_err(|e| format!("open tgz {}: {e}", self.path.display()))?;
@@ -210,7 +235,13 @@ impl Source for TgzSource {
             let entry_path = std::str::from_utf8(file.path_bytes().as_ref())
                 .map_err(|e| format!("tgz entry path is not valid UTF-8: {e}"))?
                 .to_string();
-            let path = normalize_archive_entry_path(&entry_path)?;
+            let path = match normalize_archive_entry_path(&entry_path) {
+                Ok(path) => path,
+                Err(error) => {
+                    on_invalid_path(&entry_path, &error)?;
+                    continue;
+                }
+            };
             let metadata = SourceEntry {
                 entry_path,
                 entry_type: entry_type_for_path(&path),
@@ -240,6 +271,31 @@ impl Source for TgzSource {
             if name == entry_path {
                 return io::copy(&mut file, output)
                     .map_err(|e| format!("stream tgz entry {entry_path}: {e}"));
+            }
+        }
+        Err(format!("tgz entry not found: {entry_path}"))
+    }
+
+    fn hash_entry_prefix(&self, entry_path: &str) -> Result<blake3::Hash, String> {
+        let file = fs::File::open(&self.path)
+            .map_err(|error| format!("open tgz {}: {error}", self.path.display()))?;
+        let decoder = GzDecoder::new(file);
+        let mut archive = Archive::new(decoder);
+        for entry in archive
+            .entries()
+            .map_err(|error| format!("read tgz {}: {error}", self.path.display()))?
+        {
+            let mut entry = entry
+                .map_err(|error| format!("read tgz entry {}: {error}", self.path.display()))?;
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            let path_bytes = entry.path_bytes();
+            let name = std::str::from_utf8(path_bytes.as_ref())
+                .map_err(|error| format!("tgz entry path is not valid UTF-8: {error}"))?;
+            if name == entry_path {
+                return hash_prefix(&mut entry)
+                    .map_err(|error| format!("hash entry prefix {entry_path}: {error}"));
             }
         }
         Err(format!("tgz entry not found: {entry_path}"))
@@ -287,6 +343,7 @@ impl Source for FolderSource {
         &self,
         visitor: &mut dyn FnMut(&SourceEntry, &mut dyn Read) -> Result<(), String>,
         cancelled: Option<&AtomicBool>,
+        on_invalid_path: &mut dyn FnMut(&str, &str) -> Result<(), String>,
     ) -> Result<(), String> {
         for entry in WalkDir::new(&self.root).into_iter() {
             check_scan_cancelled(cancelled)?;
@@ -304,7 +361,13 @@ impl Source for FolderSource {
                     format!("folder entry path is not valid Unicode: {}", path.display())
                 })?
                 .replace('\\', "/");
-            let normalized = normalize_archive_entry_path(&entry_path)?;
+            let normalized = match normalize_archive_entry_path(&entry_path) {
+                Ok(path) => path,
+                Err(error) => {
+                    on_invalid_path(&entry_path, &error)?;
+                    continue;
+                }
+            };
             let metadata = fs::metadata(path)
                 .map_err(|e| format!("read file metadata {}: {e}", path.display()))?;
             let source_entry = SourceEntry {
@@ -330,6 +393,17 @@ impl Source for FolderSource {
         io::copy(&mut file, output).map_err(|e| format!("stream file {}: {e}", path.display()))
     }
 
+    fn hash_entry_prefix(&self, entry_path: &str) -> Result<blake3::Hash, String> {
+        let normalized = normalize_archive_entry_path(entry_path)?;
+        let path = normalized
+            .split('/')
+            .fold(self.root.clone(), |current, part| current.join(part));
+        let mut file = fs::File::open(&path)
+            .map_err(|error| format!("open file {}: {error}", path.display()))?;
+        hash_prefix(&mut file)
+            .map_err(|error| format!("hash file prefix {}: {error}", path.display()))
+    }
+
     fn read_video_duration_seconds(&self, entry_path: &str) -> Result<Option<f64>, String> {
         let normalized = normalize_archive_entry_path(entry_path)?;
         let path = normalized
@@ -343,10 +417,34 @@ impl Source for FolderSource {
     }
 }
 
+fn hash_prefix(reader: &mut dyn Read) -> io::Result<blake3::Hash> {
+    const PREFIX_BYTES: usize = 64 * 1024;
+    let mut hasher = blake3::Hasher::new();
+    let mut read_bytes = 0;
+    let mut buffer = [0; 8 * 1024];
+    while read_bytes < PREFIX_BYTES {
+        let requested = buffer.len().min(PREFIX_BYTES - read_bytes);
+        let count = reader.read(&mut buffer[..requested])?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        read_bytes += count;
+    }
+    Ok(hasher.finalize())
+}
+
 #[derive(Debug)]
 pub struct TempIndex {
     conn: Connection,
+    skipped_entry_warnings: std::sync::Mutex<HashMap<String, SkippedEntryWarnings>>,
     _temp_dir: tempfile::TempDir,
+}
+
+#[derive(Debug, Default)]
+struct SkippedEntryWarnings {
+    messages: Vec<String>,
+    total: u64,
 }
 
 impl TempIndex {
@@ -381,8 +479,54 @@ impl TempIndex {
         .map_err(|e| format!("create archive index table: {e}"))?;
         Ok(Self {
             conn,
+            skipped_entry_warnings: std::sync::Mutex::new(HashMap::new()),
             _temp_dir: temp_dir,
         })
+    }
+
+    fn record_skipped_entry(
+        &self,
+        archive_path: &str,
+        entry_path: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        let mut warnings = self
+            .skipped_entry_warnings
+            .lock()
+            .map_err(|error| format!("lock skipped-entry warnings: {error}"))?;
+        let summary = warnings.entry(archive_path.to_string()).or_default();
+        summary.total = summary.total.saturating_add(1);
+        if summary.messages.len() < 100 {
+            summary
+                .messages
+                .push(format!("Skipped entry {entry_path}: {reason}"));
+        }
+        Ok(())
+    }
+
+    fn skipped_entry_warning_messages(&self) -> Result<Vec<String>, String> {
+        let warnings = self
+            .skipped_entry_warnings
+            .lock()
+            .map_err(|error| format!("lock skipped-entry warnings: {error}"))?;
+        let mut archives = warnings.iter().collect::<Vec<_>>();
+        archives.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let total = archives
+            .iter()
+            .map(|(_, summary)| summary.total)
+            .fold(0u64, u64::saturating_add);
+        let mut messages = archives
+            .iter()
+            .flat_map(|(_, summary)| summary.messages.iter().cloned())
+            .take(100)
+            .collect::<Vec<_>>();
+        if total > messages.len() as u64 {
+            messages.push(format!(
+                "Skipped {} additional entries; individual warning details are capped at 100.",
+                total - messages.len() as u64
+            ));
+        }
+        Ok(messages)
     }
 
     fn set_sidecar(
@@ -417,6 +561,10 @@ impl TempIndex {
                 [archive_path],
             )
             .map_err(|error| format!("remove archive from index {archive_path}: {error}"))?;
+        self.skipped_entry_warnings
+            .lock()
+            .map_err(|error| format!("lock skipped-entry warnings: {error}"))?
+            .remove(archive_path);
         Ok(())
     }
 
@@ -426,9 +574,12 @@ impl TempIndex {
             .iter()
             .filter(|entry| matches!(entry.entry_type, EntryType::Photo | EntryType::Video))
             .collect::<Vec<_>>();
-        let media_paths = media_entries
+        let media_candidates = media_entries
             .iter()
-            .map(|entry| entry.path.clone())
+            .map(|entry| matcher::MediaCandidate {
+                archive_path: entry.archive_path.clone(),
+                path: entry.path.clone(),
+            })
             .collect::<Vec<_>>();
         let mut statement = self
             .conn
@@ -471,7 +622,7 @@ impl TempIndex {
             )
             .map_err(|error| format!("clear sidecar matches: {error}"))?;
 
-        let matches = matcher::match_sidecars(&media_paths, &sidecars);
+        let matches = matcher::match_sidecars_for_media(&media_candidates, &sidecars);
         for (entry, matched) in media_entries.iter().zip(matches) {
             if let Some(matched) = matched {
                 self.set_sidecar(
@@ -487,21 +638,25 @@ impl TempIndex {
     }
 
     pub fn entries(&self) -> Result<Vec<IndexedEntry>, String> {
-        self.entries_limited(None, false)
+        self.entries_limited(None, EntryFilter::All)
     }
 
     pub fn media_entries(&self) -> Result<Vec<IndexedEntry>, String> {
-        self.entries_limited(None, true)
+        self.entries_limited(None, EntryFilter::Media)
+    }
+
+    pub fn processing_entries(&self) -> Result<Vec<IndexedEntry>, String> {
+        self.entries_limited(None, EntryFilter::Processable)
     }
 
     pub fn preview_entries(&self, limit: usize) -> Result<Vec<IndexedEntry>, String> {
-        self.entries_limited(Some(limit), true)
+        self.entries_limited(Some(limit), EntryFilter::Processable)
     }
 
     fn entries_limited(
         &self,
         limit: Option<usize>,
-        media_only: bool,
+        entry_filter: EntryFilter,
     ) -> Result<Vec<IndexedEntry>, String> {
         let mut statement = self
             .conn
@@ -515,7 +670,8 @@ impl TempIndex {
                  LEFT JOIN entries AS sidecar
                    ON sidecar.archive_path = entry.sidecar_archive_path
                   AND sidecar.path = entry.sidecar_path
-                 WHERE (?2 = 0 OR entry.kind IN ('photo', 'video'))
+                 WHERE (?2 = 0 OR entry.kind IN ('photo', 'video')
+                        OR (?2 = 2 AND entry.kind = 'other'))
                  ORDER BY entry.archive_path, entry.path
                  LIMIT COALESCE(?1, -1)",
             )
@@ -524,7 +680,7 @@ impl TempIndex {
             .query_map(
                 [
                     limit.map(|value| value.min(i64::MAX as usize) as i64),
-                    Some(i64::from(media_only)),
+                    Some(entry_filter as i64),
                 ],
                 |row| {
                     let kind: String = row.get(4)?;
@@ -644,6 +800,14 @@ impl TempIndex {
             .max_by_key(|(_, count)| *count)
             .map(|(name, _)| name))
     }
+}
+
+#[derive(Clone, Copy)]
+#[repr(i64)]
+enum EntryFilter {
+    All = 0,
+    Media = 1,
+    Processable = 2,
 }
 
 struct IndexInsertBatch<'a> {
@@ -804,13 +968,25 @@ pub fn index_archive_into(
     progress.total_bytes = total_bytes;
     emit_scan_progress(on_progress, last_progress, progress)?;
     let mut insert_batch = IndexInsertBatch::new(&index.conn)?;
+    let invalid_paths_seen = std::cell::Cell::new(0u64);
 
     let visit_result = source.visit_entries(
         &mut |entry, reader| {
             check_scan_cancelled(cancelled)?;
             let mut reader = CountingReader::new(reader, cancelled);
             let metadata = if entry.entry_type == EntryType::JsonSidecar {
-                Some(crate::metadata::TakeoutMetadata::from_reader(&mut reader)?)
+                match crate::metadata::TakeoutMetadata::from_reader(&mut reader) {
+                    Ok(metadata) => Some(metadata),
+                    Err(error) => {
+                        check_scan_cancelled(cancelled)?;
+                        index.record_skipped_entry(&archive_path, &entry.entry_path, &error)?;
+                        progress.entries_seen = progress.entries_seen.saturating_add(1);
+                        progress.bytes_read =
+                            progress.bytes_read.saturating_add(reader.bytes_read());
+                        emit_scan_progress(on_progress, last_progress, progress)?;
+                        return Ok(());
+                    }
+                }
             } else {
                 None
             };
@@ -836,7 +1012,14 @@ pub fn index_archive_into(
             Ok(())
         },
         cancelled,
+        &mut |entry_path, error| {
+            invalid_paths_seen.set(invalid_paths_seen.get().saturating_add(1));
+            index.record_skipped_entry(&archive_path, entry_path, error)
+        },
     );
+    progress.entries_seen = progress
+        .entries_seen
+        .saturating_add(invalid_paths_seen.get());
     if let Err(error) = visit_result {
         drop(insert_batch);
         return match index.remove_archive(&archive_path) {
@@ -919,6 +1102,13 @@ fn classify_entry_path(path: &str) -> (Option<String>, bool, bool) {
 }
 
 fn entry_type_for_path(path: &str) -> EntryType {
+    if Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("metadata.json"))
+    {
+        return EntryType::AlbumMetadata;
+    }
     let extension = Path::new(path)
         .extension()
         .and_then(|extension| extension.to_str())
@@ -931,6 +1121,10 @@ fn entry_type_for_path(path: &str) -> EntryType {
         "jpg"
             | "jpeg"
             | "png"
+            | "gif"
+            | "bmp"
+            | "avif"
+            | "jfif"
             | "heic"
             | "heif"
             | "webp"
@@ -942,11 +1136,30 @@ fn entry_type_for_path(path: &str) -> EntryType {
             | "arw"
             | "orf"
             | "rw2"
+            | "cr3"
+            | "nrw"
+            | "raf"
+            | "pef"
+            | "sr2"
     ) {
         EntryType::Photo
     } else if matches!(
         extension.as_str(),
-        "mp4" | "mov" | "m4v" | "avi" | "mkv" | "3gp" | "mts" | "m2ts"
+        "mp4"
+            | "mov"
+            | "m4v"
+            | "avi"
+            | "mkv"
+            | "3gp"
+            | "mts"
+            | "m2ts"
+            | "webm"
+            | "mpg"
+            | "mpeg"
+            | "wmv"
+            | "flv"
+            | "3g2"
+            | "mp"
     ) {
         EntryType::Video
     } else {
@@ -959,6 +1172,7 @@ fn entry_type_name(entry_type: EntryType) -> &'static str {
         EntryType::Photo => "photo",
         EntryType::Video => "video",
         EntryType::JsonSidecar => "jsonSidecar",
+        EntryType::AlbumMetadata => "albumMetadata",
         EntryType::Other => "other",
     }
 }
@@ -968,6 +1182,7 @@ fn parse_entry_type(value: &str) -> Result<EntryType, String> {
         "photo" => Ok(EntryType::Photo),
         "video" => Ok(EntryType::Video),
         "jsonSidecar" => Ok(EntryType::JsonSidecar),
+        "albumMetadata" => Ok(EntryType::AlbumMetadata),
         "other" => Ok(EntryType::Other),
         _ => Err(format!("unknown archive entry type: {value}")),
     }
@@ -1253,6 +1468,7 @@ pub fn scan_result_from_index(
     if let Some(root) = index.google_photos_root()? {
         warnings.push(format!("Detected Google Photos folder: {root}"));
     }
+    warnings.extend(index.skipped_entry_warning_messages()?);
     Ok(ScanSourcesResult {
         files: paths.to_vec(),
         counts,
@@ -1389,6 +1605,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(zip_bytes, zip_data);
+        assert_eq!(
+            zip_source
+                .hash_entry_prefix("Takeout/Google Fotos/Photos from 2024/media.jpg")
+                .unwrap(),
+            blake3::hash(zip_data)
+        );
 
         let tgz_source = TgzSource {
             path: tgz_path.clone(),
@@ -1406,6 +1628,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tgz_bytes, tgz_data);
+        assert_eq!(
+            tgz_source
+                .hash_entry_prefix("Takeout/Google Fotos/Photos from 2024/sidecar.json")
+                .unwrap(),
+            blake3::hash(tgz_data)
+        );
 
         let folder_source = FolderSource {
             root: folder.clone(),
@@ -1419,6 +1647,10 @@ mod tests {
             .copy_entry_to("media.jpg", &mut folder_bytes)
             .unwrap();
         assert_eq!(folder_bytes, b"jpg");
+        assert_eq!(
+            folder_source.hash_entry_prefix("media.jpg").unwrap(),
+            blake3::hash(b"jpg")
+        );
     }
 
     #[test]
@@ -1437,6 +1669,7 @@ mod tests {
                 Ok(())
             },
             Some(&cancelled),
+            &mut |_, _| Ok(()),
         );
 
         assert_eq!(result, Err(SCAN_CANCELLED_ERROR.to_string()));
@@ -1472,6 +1705,36 @@ mod tests {
             detect_google_photos_root(&files).as_deref(),
             Some("Google Fotos")
         );
+    }
+
+    #[test]
+    fn classifies_additional_photo_video_and_other_extensions() {
+        for path in [
+            "photo.gif",
+            "photo.bmp",
+            "photo.avif",
+            "photo.jfif",
+            "photo.heif",
+            "photo.cr3",
+            "photo.nrw",
+            "photo.raf",
+            "photo.pef",
+            "photo.sr2",
+        ] {
+            assert_eq!(entry_type_for_path(path), EntryType::Photo, "{path}");
+        }
+        for path in [
+            "video.webm",
+            "video.mpg",
+            "video.mpeg",
+            "video.wmv",
+            "video.flv",
+            "video.3g2",
+            "video.mp",
+        ] {
+            assert_eq!(entry_type_for_path(path), EntryType::Video, "{path}");
+        }
+        assert_eq!(entry_type_for_path("notes.unknown"), EntryType::Other);
     }
 
     #[test]
@@ -1601,7 +1864,7 @@ mod tests {
             ),
             (
                 "Takeout/Google Fotos/Photos from 2023/PXL_1.json".to_string(),
-                br#"{"title":"PXL 1"}"#.as_slice(),
+                br#"{"title":"PXL_1.jpg"}"#.as_slice(),
             ),
             (
                 "Takeout/Google Fotos/Photos from 2023/IMG_3.jpg(1).json".to_string(),
@@ -1674,16 +1937,68 @@ mod tests {
             entry.path.ends_with("猫.jpg") && entry.sidecar_match.as_deref() == Some("Supplemental")
         }));
         assert!(media.iter().any(|entry| {
-            entry.path.ends_with("PXL_1.jpg") && entry.sidecar_match.as_deref() == Some("Exact")
+            entry.path.ends_with("PXL_1.jpg") && entry.sidecar_match.as_deref() == Some("Title")
         }));
         assert!(media.iter().any(|entry| {
-            entry.path.ends_with("IMG_3(1).jpg")
-                && entry.sidecar_match.as_deref() == Some("NumberedDuplicate")
+            entry.path.ends_with("IMG_3(1).jpg") && entry.sidecar_match.as_deref() == Some("Exact")
         }));
         assert!(media.iter().any(|entry| {
             entry.path.ends_with("IMG_4-edited.jpg")
                 && entry.sidecar_match.as_deref() == Some("EditedSuffixStripped")
         }));
+    }
+
+    #[test]
+    fn indexing_skips_bad_json_and_unsafe_paths_with_capped_warnings() {
+        let dir = tempdir().unwrap();
+        let archive_path = dir.path().join("takeout.zip");
+        let mut contents = vec![("../unsafe.json".to_string(), b"{}".to_vec())];
+        contents.extend(
+            (0..105).map(|index| (format!("Album/bad-{index:03}.json"), b"{invalid".to_vec())),
+        );
+        contents.extend([
+            ("Album/metadata.json".to_string(), b"{invalid".to_vec()),
+            ("Album/photo.jpg".to_string(), b"photo".to_vec()),
+            (
+                "Album/photo.jpg.json".to_string(),
+                br#"{"title":"photo.jpg"}"#.to_vec(),
+            ),
+        ]);
+        let entries = contents
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        create_zip(&archive_path, &entries);
+        let paths = vec![archive_path.to_string_lossy().to_string()];
+
+        let (result, index) = scan_paths_with_index(&paths).unwrap();
+        let indexed_entries = index.entries().unwrap();
+        let album_metadata = indexed_entries
+            .iter()
+            .find(|entry| entry.path.eq_ignore_ascii_case("Album/metadata.json"))
+            .expect("album metadata entry");
+
+        assert_eq!(result.counts.photos, 1);
+        assert_eq!(result.warnings.len(), 101);
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| { warning.contains("Skipped 6 additional entries") }));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Album/bad-")));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("../unsafe.json")));
+        assert_eq!(album_metadata.entry_type, EntryType::AlbumMetadata);
+        assert!(album_metadata.metadata.is_none());
+
+        index.remove_archive(&paths[0]).unwrap();
+        let after_remove = scan_result_from_index(&[], &index).unwrap();
+        assert!(after_remove.warnings.is_empty());
+        assert_eq!(after_remove.counts.photos, 0);
     }
 
     #[test]
@@ -1787,7 +2102,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(progress.bytes_read, (256 * 1024) + 2);
+        assert_eq!(progress.bytes_read, 256 * 1024);
         assert!(index
             .media_entries()
             .unwrap()

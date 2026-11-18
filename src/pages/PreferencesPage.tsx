@@ -67,6 +67,7 @@ export default function PreferencesPage() {
   const replaceSettings = useSettingsStore((state) => state.replaceSettings);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [deleteConfirmation, setDeleteConfirmation] = useState('');
   const [activeTab, setActiveTab] = useState('Folders');
   const [preview, setPreview] = useState<PreviewResult>({
     files: [], tree: [], warnings: [], requiredBytes: 0, freeBytes: 0,
@@ -248,14 +249,26 @@ export default function PreferencesPage() {
               {confirmDeleteOpen ? (
                 <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setConfirmDeleteOpen(false); }}>
                   <section className="advanced-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-confirm-title">
-                    <header className="advanced-dialog__header"><h2 id="delete-confirm-title">Delete each zip after it is processed?</h2></header>
-                    <p className="delete-confirm-copy">Each Takeout file is permanently deleted once its photos are saved and checked. It does not go to the Recycle Bin or Trash. To run Takeback again you would need to download your Takeout again. Your Google Photos library is not affected.</p>
+                    <header className="advanced-dialog__header"><h2 id="delete-confirm-title">Send processed archives to the Recycle Bin?</h2></header>
+                    <p className="delete-confirm-copy">Eligible Takeout archives are sent to your system's Recycle Bin or Trash only after the entire run finishes without failures. You can restore them there. To run Takeback again, you would need to download your Takeout again. Your Google Photos library is not affected.</p>
+                    <label className="delete-confirm-field">
+                      Type DELETE to confirm
+                      <input
+                        autoComplete="off"
+                        value={deleteConfirmation}
+                        onChange={(event) => setDeleteConfirmation(event.target.value)}
+                      />
+                    </label>
                     <footer className="advanced-dialog__footer">
-                      <Button onClick={() => setConfirmDeleteOpen(false)}>Cancel</Button>
+                      <Button onClick={() => {
+                        setConfirmDeleteOpen(false);
+                        setDeleteConfirmation('');
+                      }}>Cancel</Button>
                       <Button variant="accent" onClick={() => {
                         updateSettings({ deleteArchivesAfter: true });
                         setConfirmDeleteOpen(false);
-                      }}>Delete zips as I go</Button>
+                        setDeleteConfirmation('');
+                      }} disabled={deleteConfirmation !== 'DELETE'}>Send archives to Recycle Bin</Button>
                     </footer>
                   </section>
                 </div>
@@ -281,8 +294,11 @@ export default function PreferencesPage() {
               {activeTab === 'More' ? (
                 <>
                   <AdvancedRow icon={<Image />} title="Live photo style" options={['iPhone', 'Android', 'Separate files']} value={settings.liveStyle === 'iphonePair' ? 'iPhone' : settings.liveStyle === 'androidMotionPhoto' ? 'Android' : 'Separate files'} onChange={(value) => updateSettings({ liveStyle: value === 'iPhone' ? 'iphonePair' : value === 'Android' ? 'androidMotionPhoto' : 'separate' })} />
-                  <AdvancedToggle icon={<Archive />} title="Delete each zip after it is processed" checked={settings.deleteArchivesAfter} onChange={(enabled) => {
-                    if (enabled) setConfirmDeleteOpen(true);
+                  <AdvancedToggle icon={<Archive />} title="Send processed archives to Recycle Bin" checked={settings.deleteArchivesAfter} onChange={(enabled) => {
+                    if (enabled) {
+                      setDeleteConfirmation('');
+                      setConfirmDeleteOpen(true);
+                    }
                     else updateSettings({ deleteArchivesAfter: false });
                   }} />
                   <AdvancedRow icon={<Settings2 />} title="Speed" options={['Balanced', 'Gentle']} value={settings.speed === 'gentle' ? 'Gentle' : 'Balanced'} onChange={(value) => updateSettings({ speed: value === 'Gentle' ? 'gentle' : 'balanced' })} />

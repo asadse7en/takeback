@@ -1,8 +1,10 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use sysinfo::Disks;
+use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkMethod {
@@ -60,6 +62,10 @@ pub fn sanitize_file_name(name: &str) -> String {
 }
 
 pub fn disk_free_bytes(path: &Path) -> Result<u64, String> {
+    disk_space_bytes(path).map(|(available, _)| available)
+}
+
+pub fn disk_space_bytes(path: &Path) -> Result<(u64, u64), String> {
     let mut to_check = path;
     while !to_check.exists() {
         to_check = to_check
@@ -68,14 +74,15 @@ pub fn disk_free_bytes(path: &Path) -> Result<u64, String> {
     }
 
     let canonical = std::fs::canonicalize(to_check).unwrap_or_else(|_| to_check.to_path_buf());
+    let disk_path = path_for_disk_matching(&canonical);
     let disks = Disks::new_with_refreshed_list();
-    let available = if let Some(disk) = disks
+    let (available, total) = if let Some(disk) = disks
         .list()
         .iter()
-        .filter(|disk| canonical.starts_with(disk.mount_point()))
+        .filter(|disk| mount_matches_path(&disk_path, disk.mount_point()))
         .max_by_key(|disk| disk.mount_point().components().count())
     {
-        disk.available_space()
+        (disk.available_space(), disk.total_space())
     } else {
         return Err(format!(
             "unable to determine free space for {}",
@@ -83,14 +90,76 @@ pub fn disk_free_bytes(path: &Path) -> Result<u64, String> {
         ));
     };
 
-    if available == 0 {
-        return Err(format!(
-            "unable to determine free space for {}",
-            canonical.display()
-        ));
+    Ok((available, total))
+}
+
+fn mount_matches_path(path: &Path, mount_point: &Path) -> bool {
+    let path = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_lowercase();
+    let mount = mount_point
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_lowercase();
+
+    if mount.is_empty() {
+        return path.starts_with('/');
+    }
+    path == mount
+        || path
+            .strip_prefix(&mount)
+            .is_some_and(|remainder| remainder.starts_with('/'))
+}
+
+#[cfg(windows)]
+fn path_for_disk_matching(path: &Path) -> PathBuf {
+    let path_text = path.to_string_lossy();
+    if let Some(unc_path) = path_text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc_path}"));
+    }
+    if let Some(path) = path_text.strip_prefix(r"\\?\") {
+        return PathBuf::from(path);
+    }
+    path.to_path_buf()
+}
+
+#[cfg(not(windows))]
+fn path_for_disk_matching(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+pub fn cleanup_takeback_temporary_files(output_root: &Path) -> Result<u64, String> {
+    if !output_root.exists() {
+        return Ok(0);
     }
 
-    Ok(available)
+    let mut removed = 0_u64;
+    for entry in WalkDir::new(output_root).follow_links(false) {
+        let entry = entry.map_err(|error| {
+            format!(
+                "scan output folder for unfinished Takeback files {}: {error}",
+                output_root.display()
+            )
+        })?;
+        if entry.file_type().is_file()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".takeback-")
+        {
+            fs::remove_file(entry.path()).map_err(|error| {
+                format!(
+                    "remove unfinished Takeback file {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+            removed = removed.saturating_add(1);
+        }
+    }
+    Ok(removed)
 }
 
 pub fn existing_paths_in_directories(
@@ -136,13 +205,42 @@ pub fn hard_link_or_copy(src: &Path, dest: &Path) -> Result<LinkMethod, String> 
     match fs::hard_link(src, dest) {
         Ok(()) => Ok(LinkMethod::HardLink),
         Err(err) => {
-            fs::copy(src, dest).map_err(|copy_err| {
+            let mut source = fs::File::open(src).map_err(|copy_error| {
                 format!(
-                    "hard link {} -> {} failed: {err}; fallback copy failed: {copy_err}",
+                    "hard link {} -> {} failed: {err}; fallback copy could not open source: {copy_error}",
                     src.display(),
                     dest.display()
                 )
             })?;
+            let mut destination = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dest)
+                .map_err(|copy_error| {
+                    format!(
+                        "hard link {} -> {} failed: {err}; fallback copy could not create destination without replacing it: {copy_error}",
+                        src.display(),
+                        dest.display()
+                    )
+                })?;
+            if let Err(copy_error) =
+                io::copy(&mut source, &mut destination).and_then(|_| destination.flush())
+            {
+                drop(destination);
+                let cleanup_error = fs::remove_file(dest).err();
+                return Err(match cleanup_error {
+                    Some(cleanup_error) => format!(
+                        "hard link {} -> {} failed: {err}; fallback copy failed: {copy_error}; partial output cleanup failed: {cleanup_error}",
+                        src.display(),
+                        dest.display()
+                    ),
+                    None => format!(
+                        "hard link {} -> {} failed: {err}; fallback copy failed: {copy_error}",
+                        src.display(),
+                        dest.display()
+                    ),
+                });
+            }
             Ok(LinkMethod::Copy)
         }
     }
@@ -206,6 +304,18 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn mount_matching_is_case_insensitive_and_respects_component_boundaries() {
+        assert!(mount_matches_path(
+            Path::new("C:/Photo Library/June"),
+            Path::new("c:/photo library")
+        ));
+        assert!(!mount_matches_path(
+            Path::new("C:/Photo Library2"),
+            Path::new("c:/photo library")
+        ));
+    }
+
+    #[test]
     fn output_root_uses_new_or_empty_folder_directly() {
         let temp = tempdir().expect("create test directory");
         let pictures = temp.path().join("Pictures");
@@ -237,6 +347,39 @@ mod tests {
         assert_eq!(
             resolve_output_root(Some(&selected), temp.path()).expect("resolve output root"),
             selected.join("Photo Library")
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_only_takeback_temporary_files_recursively() {
+        let temp = tempdir().expect("create output directory");
+        let nested = temp.path().join("2025/06");
+        fs::create_dir_all(&nested).expect("create nested output directory");
+        let temporary = nested.join(".takeback-abc.jpg");
+        let ordinary = nested.join("photo.jpg");
+        fs::write(&temporary, b"partial").expect("write temporary file");
+        fs::write(&ordinary, b"complete").expect("write ordinary file");
+
+        assert_eq!(
+            cleanup_takeback_temporary_files(temp.path()).expect("clean temporary outputs"),
+            1
+        );
+        assert!(!temporary.exists());
+        assert!(ordinary.exists());
+    }
+
+    #[test]
+    fn hard_link_or_copy_never_replaces_an_existing_destination() {
+        let temp = tempdir().expect("create output directory");
+        let source = temp.path().join("source.jpg");
+        let destination = temp.path().join("existing.jpg");
+        fs::write(&source, b"source contents").expect("write source");
+        fs::write(&destination, b"existing contents").expect("write destination");
+
+        assert!(hard_link_or_copy(&source, &destination).is_err());
+        assert_eq!(
+            fs::read(&destination).expect("read existing destination"),
+            b"existing contents"
         );
     }
 }

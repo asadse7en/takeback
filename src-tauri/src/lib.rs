@@ -4,6 +4,7 @@ pub mod engine;
 pub mod error;
 pub mod events;
 pub mod livephoto;
+pub mod manifest;
 pub mod metadata;
 pub mod organize;
 pub mod pipeline;
@@ -24,6 +25,7 @@ pub fn run() {
             commands::remove_source,
             commands::get_preview,
             commands::start_processing,
+            commands::run_status,
             commands::cancel_processing,
             commands::load_settings,
             commands::save_settings,

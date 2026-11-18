@@ -1,7 +1,10 @@
-use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::fs;
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::SystemTime;
+use std::sync::mpsc::{self, Receiver};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, FixedOffset, Local, Offset, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -94,7 +97,24 @@ struct RawPerson {
 }
 
 impl TakeoutMetadata {
-    pub fn from_reader(reader: impl Read) -> Result<Self, String> {
+    pub fn from_reader(mut reader: impl Read) -> Result<Self, String> {
+        let mut prefix = [0; 3];
+        let mut prefix_len = 0;
+        while prefix_len < prefix.len() {
+            match reader.read(&mut prefix[prefix_len..]) {
+                Ok(0) => break,
+                Ok(count) => prefix_len += count,
+                Err(error) => {
+                    return Err(format!("read Takeout JSON sidecar: {error}"));
+                }
+            }
+        }
+        let prefix = if prefix_len == 3 && prefix == [0xEF, 0xBB, 0xBF] {
+            Vec::new()
+        } else {
+            prefix[..prefix_len].to_vec()
+        };
+        let reader = Cursor::new(prefix).chain(reader);
         let raw: RawTakeoutMetadata = serde_json::from_reader(reader)
             .map_err(|error| format!("invalid Takeout JSON sidecar: {error}"))?;
 
@@ -145,11 +165,12 @@ pub fn supports_embedded_metadata(path: &Path) -> bool {
         Some(
             "jpg"
                 | "jpeg"
+                | "jfif"
                 | "png"
                 | "webp"
+                | "avif"
                 | "heic"
                 | "heif"
-                | "gif"
                 | "tif"
                 | "tiff"
                 | "dng"
@@ -167,23 +188,68 @@ pub fn supports_embedded_metadata(path: &Path) -> bool {
                 | "mp4"
                 | "mov"
                 | "m4v"
+                | "mpeg"
+                | "3g2"
+                | "mp"
         )
     )
+}
+
+pub const EXIFTOOL_VIDEO_MAX_BYTES: u64 = 500 * 1024 * 1024;
+pub const EXIFTOOL_BATCH_SIZE: usize = 25;
+
+pub fn is_large_metadata_video(path: &Path, size_bytes: u64) -> bool {
+    size_bytes > EXIFTOOL_VIDEO_MAX_BYTES
+        && matches!(
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("mp4" | "mov" | "m4v" | "mpeg" | "3g2" | "mp")
+        )
+}
+
+#[derive(Clone)]
+pub struct MetadataWriteRequest {
+    pub path: PathBuf,
+    pub metadata: TakeoutMetadata,
+    pub time_zone: TimeZoneMode,
+    pub timezone_name: Option<String>,
+    pub write_gps: bool,
+    pub write_descriptions: bool,
+    pub rate_favorites: bool,
 }
 
 pub struct ExifTool {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
+    stderr: Receiver<String>,
+    stderr_reader: Option<JoinHandle<()>>,
 }
 
 impl ExifTool {
     pub fn new(executable: &Path) -> Result<Self, String> {
-        let mut child = Command::new(executable)
-            .args(["-stay_open", "True", "-@", "-"])
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "-stay_open",
+                "True",
+                "-@",
+                "-",
+                "-common_args",
+                "-charset",
+                "filename=UTF8",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        let mut child = command
             .spawn()
             .map_err(|error| format!("start bundled ExifTool: {error}"))?;
         let input = child
@@ -194,12 +260,34 @@ impl ExifTool {
             .stdout
             .take()
             .ok_or_else(|| "could not open ExifTool output".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "could not open ExifTool stderr".to_string())?;
+        let (stderr_sender, stderr_receiver) = mpsc::channel();
+        let stderr_reader = thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                match line {
+                    Ok(line) => {
+                        if stderr_sender.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = stderr_sender
+                            .send(format!("Error: could not read ExifTool stderr: {error}"));
+                        break;
+                    }
+                }
+            }
+        });
         let mut tool = Self {
             child,
             input,
             output: BufReader::new(output),
+            stderr: stderr_receiver,
+            stderr_reader: Some(stderr_reader),
         };
-        tool.execute(&["-charset".to_string(), "filename=UTF8".to_string()])?;
         let version = tool.execute(&["-ver".to_string()])?;
         if version.trim().is_empty() {
             return Err("bundled ExifTool did not report its version".to_string());
@@ -212,55 +300,149 @@ impl ExifTool {
         path: &Path,
         metadata: &TakeoutMetadata,
         time_zone: TimeZoneMode,
+        timezone_name: Option<&str>,
         write_gps: bool,
         write_descriptions: bool,
         rate_favorites: bool,
     ) -> Result<Vec<String>, String> {
-        let source_file = path
-            .to_str()
-            .ok_or_else(|| format!("file path is not valid Unicode: {}", path.display()))?;
-        let offset = if time_zone == TimeZoneMode::Local && metadata.taken_timestamp().is_some() {
-            self.read_original_offset(source_file)?
-        } else {
-            None
-        };
-        let tags = metadata_tags(
-            source_file,
-            metadata,
+        let request = MetadataWriteRequest {
+            path: path.to_path_buf(),
+            metadata: metadata.clone(),
             time_zone,
-            offset.as_deref(),
+            timezone_name: timezone_name.map(str::to_string),
             write_gps,
             write_descriptions,
             rate_favorites,
-        )?;
-        if tags.len() <= 1 {
-            return self.set_modified_time(path, metadata);
-        }
+        };
+        self.write_batch(std::slice::from_ref(&request))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "ExifTool did not return a metadata result".to_string())
+    }
 
-        let parent = path
-            .parent()
-            .ok_or_else(|| format!("output path has no parent: {}", path.display()))?;
-        let mut json_file = tempfile::Builder::new()
-            .prefix(".takeback-metadata-")
-            .suffix(".json")
-            .tempfile_in(parent)
-            .map_err(|error| format!("create temporary metadata file: {error}"))?;
-        serde_json::to_writer(&mut json_file, &Value::Array(vec![Value::Object(tags)]))
-            .map_err(|error| format!("serialize metadata for {}: {error}", path.display()))?;
-        json_file
-            .flush()
-            .map_err(|error| format!("flush temporary metadata file: {error}"))?;
-        let json_file_path = json_file.into_temp_path();
-        let json_path = json_file_path
-            .to_str()
-            .ok_or_else(|| "temporary metadata path is not valid Unicode".to_string())?;
-        let output = self.execute(&[
-            "-overwrite_original".to_string(),
-            format!("-json={json_path}"),
-        ])?;
-        drop(json_file_path);
-        let mut warnings = tool_warnings(&output);
-        warnings.extend(self.set_modified_time(path, metadata)?);
+    pub fn write_batch(
+        &mut self,
+        requests: &[MetadataWriteRequest],
+    ) -> Result<Vec<Vec<String>>, String> {
+        let mut warnings = vec![Vec::new(); requests.len()];
+        for batch_start in (0..requests.len()).step_by(EXIFTOOL_BATCH_SIZE) {
+            let batch_end = (batch_start + EXIFTOOL_BATCH_SIZE).min(requests.len());
+            let mut objects = Vec::new();
+            let mut object_indices = Vec::new();
+
+            for index in batch_start..batch_end {
+                let request = &requests[index];
+                if is_large_metadata_video(
+                    &request.path,
+                    fs::metadata(&request.path)
+                        .map_err(|error| {
+                            format!(
+                                "inspect video before metadata write {}: {error}",
+                                request.path.display()
+                            )
+                        })?
+                        .len(),
+                ) {
+                    if let Err(error) = self.set_modified_time(&request.path, &request.metadata) {
+                        warnings[index].push(format!("Error: {error}"));
+                    }
+                    warnings[index].push(
+                        "ExifTool metadata rewrite was skipped for a video over 500 MB; only the file modified time was set when available.".to_string(),
+                    );
+                    continue;
+                }
+                let Some(source_file) = request.path.to_str() else {
+                    warnings[index].push(format!(
+                        "Error: file path is not valid Unicode: {}",
+                        request.path.display()
+                    ));
+                    continue;
+                };
+                let original_offset = if request.time_zone == TimeZoneMode::Local
+                    && request.timezone_name.is_none()
+                    && request.metadata.taken_timestamp().is_some()
+                {
+                    match self.read_original_offset(source_file) {
+                        Ok(offset) => offset,
+                        Err(error) => {
+                            warnings[index].push(format!("Error: {error}"));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let tags = match metadata_tags(
+                    source_file,
+                    &request.metadata,
+                    request.time_zone,
+                    request.timezone_name.as_deref(),
+                    original_offset.as_deref(),
+                    request.write_gps,
+                    request.write_descriptions,
+                    request.rate_favorites,
+                ) {
+                    Ok(tags) => tags,
+                    Err(error) => {
+                        warnings[index].push(format!("Error: {error}"));
+                        continue;
+                    }
+                };
+                if tags.len() <= 1 {
+                    if let Err(error) = self.set_modified_time(&request.path, &request.metadata) {
+                        warnings[index].push(format!("Error: {error}"));
+                    }
+                    continue;
+                }
+                objects.push(Value::Object(tags));
+                object_indices.push(index);
+            }
+
+            if objects.is_empty() {
+                continue;
+            }
+            let first_path = &requests[object_indices[0]].path;
+            let parent = first_path
+                .parent()
+                .ok_or_else(|| format!("output path has no parent: {}", first_path.display()))?;
+            let mut json_file = tempfile::Builder::new()
+                .prefix(".takeback-metadata-")
+                .suffix(".json")
+                .tempfile_in(parent)
+                .map_err(|error| format!("create temporary metadata file: {error}"))?;
+            serde_json::to_writer(&mut json_file, &Value::Array(objects)).map_err(|error| {
+                format!(
+                    "serialize metadata batch starting at {}: {error}",
+                    first_path.display()
+                )
+            })?;
+            json_file
+                .flush()
+                .map_err(|error| format!("flush temporary metadata file: {error}"))?;
+            let json_file_path = json_file.into_temp_path();
+            let json_path = json_file_path
+                .to_str()
+                .ok_or_else(|| "temporary metadata path is not valid Unicode".to_string())?;
+            let output = self.execute_raw(&[
+                "-overwrite_original".to_string(),
+                format!("-json={json_path}"),
+            ]);
+            drop(json_file_path);
+
+            let diagnostics = match output {
+                Ok(output) => tool_warnings(&output),
+                Err(error) => vec![format!("Error: {error}")],
+            };
+            distribute_batch_warnings(&diagnostics, &object_indices, requests, &mut warnings);
+
+            for index in object_indices {
+                if let Err(error) =
+                    self.set_modified_time(&requests[index].path, &requests[index].metadata)
+                {
+                    warnings[index].push(format!("Error: {error}"));
+                }
+            }
+        }
         Ok(warnings)
     }
 
@@ -379,6 +561,17 @@ impl ExifTool {
     }
 
     fn execute(&mut self, args: &[String]) -> Result<String, String> {
+        let response = self.execute_raw(args)?;
+        if let Some(error) = response
+            .lines()
+            .find(|line| line.trim_start().starts_with("Error:"))
+        {
+            return Err(error.trim().to_string());
+        }
+        Ok(response)
+    }
+
+    fn execute_raw(&mut self, args: &[String]) -> Result<String, String> {
         for arg in args {
             if arg.contains('\n') || arg.contains('\r') {
                 return Err("ExifTool arguments cannot contain line breaks".to_string());
@@ -406,8 +599,16 @@ impl ExifTool {
             response.push_str(&line);
         }
 
-        if let Some(error) = response.lines().find(|line| line.starts_with("Error:")) {
-            return Err(error.trim().to_string());
+        loop {
+            match self.stderr.recv_timeout(Duration::from_millis(10)) {
+                Ok(line) => {
+                    response.push_str(&line);
+                    response.push('\n');
+                }
+                Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+            }
         }
         Ok(response)
     }
@@ -419,6 +620,9 @@ impl Drop for ExifTool {
         let _ = writeln!(self.input, "False");
         let _ = self.input.flush();
         let _ = self.child.wait();
+        if let Some(stderr_reader) = self.stderr_reader.take() {
+            let _ = stderr_reader.join();
+        }
     }
 }
 
@@ -426,6 +630,7 @@ fn metadata_tags(
     source_file: &str,
     metadata: &TakeoutMetadata,
     time_zone: TimeZoneMode,
+    timezone_name: Option<&str>,
     original_offset: Option<&str>,
     write_gps: bool,
     write_descriptions: bool,
@@ -438,7 +643,7 @@ fn metadata_tags(
             .and_then(|extension| extension.to_str())
             .map(str::to_ascii_lowercase)
             .as_deref(),
-        Some("mp4" | "mov" | "m4v")
+        Some("mp4" | "mov" | "m4v" | "mpeg" | "3g2" | "mp")
     );
     tags.insert(
         "SourceFile".to_string(),
@@ -448,7 +653,7 @@ fn metadata_tags(
     if let Some(timestamp) = metadata.taken_timestamp() {
         let utc = DateTime::<Utc>::from_timestamp(timestamp, 0)
             .ok_or_else(|| format!("invalid Takeout timestamp: {timestamp}"))?;
-        let datetime = datetime_with_offset(utc, time_zone, original_offset, metadata);
+        let datetime = datetime_with_offset(utc, time_zone, timezone_name, original_offset)?;
         let iso_datetime = datetime.format("%Y-%m-%dT%H:%M:%S%:z").to_string();
         let utc_datetime = utc.format("%Y:%m:%d %H:%M:%S").to_string();
         if is_video {
@@ -549,10 +754,17 @@ fn metadata_tags(
 fn datetime_with_offset(
     utc: DateTime<Utc>,
     time_zone: TimeZoneMode,
+    timezone_name: Option<&str>,
     original_offset: Option<&str>,
-    metadata: &TakeoutMetadata,
-) -> DateTime<FixedOffset> {
-    match time_zone {
+) -> Result<DateTime<FixedOffset>, String> {
+    if let Some(name) = timezone_name {
+        let timezone = name.parse::<chrono_tz::Tz>().map_err(|_| {
+            format!("The media item's time zone is not a recognized IANA zone: {name}")
+        })?;
+        return Ok(utc.with_timezone(&timezone).fixed_offset());
+    }
+
+    Ok(match time_zone {
         TimeZoneMode::Utc => utc.with_timezone(&utc.offset().fix()),
         TimeZoneMode::Computer => {
             let offset = utc.with_timezone(&Local).offset().fix();
@@ -560,14 +772,35 @@ fn datetime_with_offset(
         }
         TimeZoneMode::Local => {
             if let Some(offset) = original_offset.and_then(parse_offset) {
-                return utc.with_timezone(&offset);
-            }
-            if let Some(offset) = gps_timezone_offset(utc, metadata) {
-                return utc.with_timezone(&offset);
+                return Ok(utc.with_timezone(&offset));
             }
             let offset = utc.with_timezone(&Local).offset().fix();
             utc.with_timezone(&offset)
         }
+    })
+}
+
+pub fn computer_timezone_name() -> Result<String, String> {
+    let name = iana_time_zone::get_timezone()
+        .map_err(|error| format!("Could not determine the computer time zone: {error}"))?;
+    name.parse::<chrono_tz::Tz>()
+        .map(|timezone| timezone.name().to_string())
+        .map_err(|_| format!("The computer time zone is not a recognized IANA zone: {name}"))
+}
+
+pub fn timezone_name_for_item(
+    time_zone: crate::settings::TimeZoneMode,
+    metadata: Option<&TakeoutMetadata>,
+    computer_timezone: Option<&str>,
+) -> Result<String, String> {
+    match time_zone {
+        crate::settings::TimeZoneMode::Utc => Ok("UTC".to_string()),
+        crate::settings::TimeZoneMode::Computer => computer_timezone
+            .map(str::to_string)
+            .ok_or_else(|| "The computer time zone was not resolved.".to_string()),
+        crate::settings::TimeZoneMode::Local => gps_timezone_name(metadata)
+            .or_else(|| computer_timezone.map(str::to_string))
+            .ok_or_else(|| "The computer time zone was not resolved.".to_string()),
     }
 }
 
@@ -589,21 +822,89 @@ fn parse_offset(value: &str) -> Option<FixedOffset> {
     FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60))
 }
 
-fn gps_timezone_offset(utc: DateTime<Utc>, metadata: &TakeoutMetadata) -> Option<FixedOffset> {
+fn gps_timezone_name(metadata: Option<&TakeoutMetadata>) -> Option<String> {
+    let metadata = metadata?;
     let (latitude, longitude) = (metadata.latitude?, metadata.longitude?);
     static FINDER: OnceLock<tzf_rs::DefaultFinder> = OnceLock::new();
     let finder = FINDER.get_or_init(tzf_rs::DefaultFinder::new);
     let timezone_name = finder.get_tz_name(longitude, latitude);
-    let timezone = timezone_name.parse::<chrono_tz::Tz>().ok()?;
-    Some(utc.with_timezone(&timezone).offset().fix())
+    timezone_name
+        .parse::<chrono_tz::Tz>()
+        .ok()
+        .map(|timezone| timezone.name().to_string())
 }
 
 fn tool_warnings(output: &str) -> Vec<String> {
     output
         .lines()
-        .filter(|line| line.starts_with("Warning:"))
+        .filter(|line| {
+            let line = line.trim_start();
+            let lowercase = line.to_ascii_lowercase();
+            line.starts_with("Warning:")
+                || line.starts_with("Error:")
+                || (lowercase.contains("files weren") && lowercase.contains("updated"))
+        })
         .map(str::to_string)
         .collect()
+}
+
+fn distribute_batch_warnings(
+    diagnostics: &[String],
+    object_indices: &[usize],
+    requests: &[MetadataWriteRequest],
+    warnings: &mut [Vec<String>],
+) {
+    let failed_indices = diagnostics
+        .iter()
+        .filter(|line| line.trim_start().starts_with("Error:"))
+        .flat_map(|line| matching_request_indices(line, object_indices, requests))
+        .collect::<std::collections::HashSet<_>>();
+
+    for diagnostic in diagnostics {
+        let normalized_diagnostic = normalize_diagnostic_path(diagnostic);
+        let matching = object_indices
+            .iter()
+            .copied()
+            .filter(|index| {
+                let path = normalize_diagnostic_path(&requests[*index].path.to_string_lossy());
+                normalized_diagnostic.contains(&path)
+            })
+            .collect::<Vec<_>>();
+        let lowercase = diagnostic.to_ascii_lowercase();
+        let targets = if lowercase.contains("files weren")
+            && lowercase.contains("updated")
+            && !failed_indices.is_empty()
+        {
+            failed_indices.iter().copied().collect::<Vec<_>>()
+        } else if matching.is_empty() {
+            object_indices.to_vec()
+        } else {
+            matching
+        };
+        for index in targets {
+            warnings[index].push(diagnostic.clone());
+        }
+    }
+}
+
+fn matching_request_indices(
+    diagnostic: &str,
+    object_indices: &[usize],
+    requests: &[MetadataWriteRequest],
+) -> Vec<usize> {
+    let normalized_diagnostic = normalize_diagnostic_path(diagnostic);
+    object_indices
+        .iter()
+        .copied()
+        .filter(|index| {
+            let path = normalize_diagnostic_path(&requests[*index].path.to_string_lossy());
+            normalized_diagnostic.contains(&path)
+        })
+        .collect()
+}
+
+fn normalize_diagnostic_path(value: &str) -> String {
+    value.replace('\\', "/").to_lowercase()
 }
 
 #[cfg(test)]
@@ -639,6 +940,15 @@ mod tests {
     }
 
     #[test]
+    fn strips_utf8_bom_before_parsing() {
+        let json = b"\xEF\xBB\xBF{\"title\":\"photo.jpg\"}";
+
+        let metadata = TakeoutMetadata::from_reader(json.as_slice()).expect("parse metadata");
+
+        assert_eq!(metadata.title.as_deref(), Some("photo.jpg"));
+    }
+
+    #[test]
     fn metadata_tags_respect_toggles_and_timezone() {
         let metadata = TakeoutMetadata {
             photo_taken_time: Some(1_700_000_000),
@@ -654,6 +964,7 @@ mod tests {
             "out.jpg",
             &metadata,
             TimeZoneMode::Utc,
+            None,
             None,
             false,
             false,
@@ -673,6 +984,7 @@ mod tests {
             "out.jpg",
             &metadata,
             TimeZoneMode::Utc,
+            None,
             None,
             true,
             true,
@@ -694,13 +1006,23 @@ mod tests {
         assert_eq!(enabled_tags.get("XMP:Rating"), Some(&Value::from(5)));
 
         let utc = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("valid timestamp");
-        let local = datetime_with_offset(utc, TimeZoneMode::Local, Some("+02:00"), &metadata);
-        assert_eq!(local.format("%:z").to_string(), "+02:00");
+        let local = datetime_with_offset(
+            utc,
+            TimeZoneMode::Local,
+            Some("America/Los_Angeles"),
+            Some("+02:00"),
+        )
+        .expect("use item time zone");
+        assert_eq!(local.format("%:z").to_string(), "-08:00");
+        let offset_fallback = datetime_with_offset(utc, TimeZoneMode::Local, None, Some("+02:00"))
+            .expect("use original offset fallback");
+        assert_eq!(offset_fallback.format("%:z").to_string(), "+02:00");
 
         let video_tags = metadata_tags(
             "clip.mov",
             &metadata,
             TimeZoneMode::Utc,
+            None,
             None,
             true,
             true,
@@ -716,7 +1038,63 @@ mod tests {
     fn supported_formats_include_raw_and_common_video() {
         assert!(supports_embedded_metadata(Path::new("IMG_1.dng")));
         assert!(supports_embedded_metadata(Path::new("clip.mov")));
+        assert!(supports_embedded_metadata(Path::new("clip.mpeg")));
+        assert!(supports_embedded_metadata(Path::new("photo.avif")));
+        assert!(supports_embedded_metadata(Path::new("photo.jfif")));
+        for path in [
+            "animation.gif",
+            "image.bmp",
+            "clip.webm",
+            "clip.mpg",
+            "clip.wmv",
+            "clip.flv",
+        ] {
+            assert!(!supports_embedded_metadata(Path::new(path)));
+        }
         assert!(!supports_embedded_metadata(Path::new("archive.bin")));
+    }
+
+    #[test]
+    fn large_video_metadata_is_skipped_above_the_limit_only() {
+        assert!(!is_large_metadata_video(
+            Path::new("clip.mp4"),
+            EXIFTOOL_VIDEO_MAX_BYTES
+        ));
+        assert!(is_large_metadata_video(
+            Path::new("clip.mp4"),
+            EXIFTOOL_VIDEO_MAX_BYTES + 1
+        ));
+        assert!(!is_large_metadata_video(
+            Path::new("photo.jpg"),
+            EXIFTOOL_VIDEO_MAX_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn batch_error_and_not_updated_lines_are_file_warnings() {
+        let requests = ["C:/Photos/first.jpg", "C:/Photos/second.jpg"]
+            .into_iter()
+            .map(|path| MetadataWriteRequest {
+                path: PathBuf::from(path),
+                metadata: TakeoutMetadata::default(),
+                time_zone: TimeZoneMode::Utc,
+                timezone_name: None,
+                write_gps: false,
+                write_descriptions: false,
+                rate_favorites: false,
+            })
+            .collect::<Vec<_>>();
+        let diagnostics = vec![
+            "Error: could not write C:\\Photos\\first.jpg".to_string(),
+            "1 files weren't updated due to errors".to_string(),
+        ];
+        let mut warnings = vec![Vec::new(); requests.len()];
+
+        distribute_batch_warnings(&diagnostics, &[0, 1], &requests, &mut warnings);
+
+        assert_eq!(warnings[0], diagnostics);
+        assert!(warnings[1].is_empty());
+        assert_eq!(tool_warnings(&diagnostics.join("\n")), diagnostics);
     }
 
     #[test]
@@ -745,6 +1123,7 @@ mod tests {
                 &image_path,
                 &metadata,
                 TimeZoneMode::Utc,
+                None,
                 false,
                 true,
                 false,

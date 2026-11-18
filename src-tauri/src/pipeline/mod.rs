@@ -63,6 +63,8 @@ mod tests {
                 album: None,
                 additional_albums: Vec::new(),
                 date: None,
+                time: None,
+                tz: None,
                 size_bytes,
                 is_photo: true,
                 is_video: false,

@@ -16,6 +16,7 @@ pub enum EntryType {
     Photo,
     Video,
     JsonSidecar,
+    AlbumMetadata,
     Other,
 }
 

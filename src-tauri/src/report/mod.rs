@@ -77,11 +77,12 @@ impl ReportDocument {
 
     pub fn readable_summary(&self) -> String {
         format!(
-            "Takeback run completed in {:.0} seconds.\n{} processed, {} skipped, {} failed.\n{} files without JSON, {} collisions, {} warnings.\nOutput: {}",
+            "Takeback run completed in {:.0} seconds.\n{} processed, {} skipped, {} failed.\n{} other files, {} files without JSON, {} collisions, {} warnings.\nOutput: {}",
             self.elapsed_seconds,
             self.summary.processed,
             self.summary.skipped,
             self.summary.failed,
+            self.summary.other_files,
             self.summary.files_without_json,
             self.summary.collisions,
             self.summary.warnings.len(),
@@ -124,6 +125,7 @@ impl ReportDocument {
             .and_then(|_| writeln!(writer, "Processed,{}", self.summary.processed))
             .and_then(|_| writeln!(writer, "Skipped,{}", self.summary.skipped))
             .and_then(|_| writeln!(writer, "Failed,{}", self.summary.failed))
+            .and_then(|_| writeln!(writer, "Other files,{}", self.summary.other_files))
             .and_then(|_| {
                 writeln!(
                     writer,

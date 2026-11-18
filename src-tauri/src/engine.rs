@@ -13,8 +13,13 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use zip::ZipArchive;
 
-use crate::metadata::{supports_embedded_metadata, ExifTool, TakeoutMetadata};
+use crate::manifest::{self, RunManifest};
+use crate::metadata::{
+    is_large_metadata_video, supports_embedded_metadata, ExifTool, MetadataWriteRequest,
+    TakeoutMetadata,
+};
 use crate::planner::{self, MediaItem, Placement, PlannerSettings};
 use crate::platform::disk_free_bytes;
 use crate::report::ReportItem;
@@ -32,6 +37,8 @@ pub struct RunSummary {
     pub skipped: u32,
     pub failed: u32,
     pub files_without_json: u32,
+    #[serde(default)]
+    pub other_files: u32,
     pub collisions: u32,
     pub dates_restored: u32,
     pub locations_added: u32,
@@ -43,6 +50,16 @@ pub struct RunSummary {
     pub warnings: Vec<String>,
     pub problems: Vec<String>,
     pub attention: Vec<ReportItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RunStatus {
+    pub running: bool,
+    pub paused: bool,
+    pub completed: u32,
+    pub total: u32,
+    pub summary: Option<RunSummary>,
 }
 
 #[derive(Clone)]
@@ -57,19 +74,28 @@ pub struct InputLocator {
 pub struct RunControl {
     paused: AtomicBool,
     cancelled: AtomicBool,
+    space_paused: AtomicBool,
 }
 
 impl RunControl {
     fn reset(&self) {
         self.paused.store(false, Ordering::SeqCst);
         self.cancelled.store(false, Ordering::SeqCst);
+        self.space_paused.store(false, Ordering::SeqCst);
     }
 
     pub fn pause(&self) {
+        self.space_paused.store(false, Ordering::SeqCst);
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    fn pause_for_space(&self) {
+        self.space_paused.store(true, Ordering::SeqCst);
         self.paused.store(true, Ordering::SeqCst);
     }
 
     pub fn resume(&self) {
+        self.space_paused.store(false, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
     }
 
@@ -84,6 +110,10 @@ impl RunControl {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn is_space_paused(&self) -> bool {
+        self.space_paused.load(Ordering::SeqCst)
     }
 }
 
@@ -102,8 +132,10 @@ impl RunStateStore {
     pub fn new_temp() -> Result<Self, String> {
         let dir = std::env::temp_dir().join("takeback-run-state");
         fs::create_dir_all(&dir).map_err(|e| format!("create temp run dir: {e}"))?;
-        let path = dir.join(format!("run-{}.sqlite", std::process::id()));
+        let path = run_state_path();
         let conn = Connection::open(&path).map_err(|e| format!("open run state sqlite: {e}"))?;
+        conn.busy_timeout(Duration::from_secs(2))
+            .map_err(|error| format!("configure run state sqlite: {error}"))?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS run_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
             (),
@@ -158,9 +190,80 @@ impl RunStateStore {
         Ok(())
     }
 
+    pub fn clear_summary(&self) -> Result<(), String> {
+        self.conn
+            .execute("DELETE FROM run_state WHERE key = 'summary'", ())
+            .map_err(|error| format!("clear prior run summary: {error}"))?;
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         self.path.as_path()
     }
+}
+
+fn run_state_path() -> PathBuf {
+    std::env::temp_dir()
+        .join("takeback-run-state")
+        .join(format!("run-{}.sqlite", std::process::id()))
+}
+
+pub fn run_status(running: bool) -> Result<RunStatus, String> {
+    let path = run_state_path();
+    if !path.exists() {
+        return Ok(RunStatus {
+            running,
+            ..RunStatus::default()
+        });
+    }
+    let connection =
+        Connection::open(&path).map_err(|error| format!("open run status database: {error}"))?;
+    connection
+        .busy_timeout(Duration::from_secs(2))
+        .map_err(|error| format!("configure run status database: {error}"))?;
+    let state = RunStateStore {
+        conn: connection,
+        path,
+    };
+    let completed = state
+        .get("progress.completed")?
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|error| format!("invalid completed run count: {error}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let total = state
+        .get("progress.total")?
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|error| format!("invalid total run count: {error}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let summary = state
+        .get("summary")?
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| format!("parse run summary: {error}"))
+        })
+        .transpose()?;
+    let paused = if running {
+        run_control()
+            .lock()
+            .map_err(|error| format!("run control is unavailable: {error}"))?
+            .is_paused()
+    } else {
+        false
+    };
+    Ok(RunStatus {
+        running,
+        paused,
+        completed,
+        total,
+        summary,
+    })
 }
 
 pub fn start_run(
@@ -171,11 +274,8 @@ pub fn start_run(
     let control = run_control();
     let state = RunStateStore::new_temp()?;
     let placements = planner::plan(items, settings);
-    let has_metadata = !settings.dry_run
-        && !placements.is_empty()
-        && items.iter().any(|item| {
-            item.metadata.is_some() && supports_embedded_metadata(Path::new(&item.source))
-        });
+    let has_metadata =
+        !settings.dry_run && !placements.is_empty() && items.iter().any(requires_exiftool_metadata);
     let has_live_photo_writes = !settings.dry_run
         && placements.iter().any(|placement| {
             placement.tags.iter().any(|tag| {
@@ -187,17 +287,18 @@ pub fn start_run(
     } else {
         None
     };
-    let metadata_by_source: HashMap<&str, &TakeoutMetadata> = items
+    let metadata_by_source: HashMap<&str, (&TakeoutMetadata, Option<&str>)> = items
         .iter()
         .filter_map(|item| {
             item.metadata
                 .as_ref()
-                .map(|metadata| (item.source.as_str(), metadata))
+                .map(|metadata| (item.source.as_str(), (metadata, item.tz.as_deref())))
         })
         .collect();
     let mut processed_outputs = HashMap::<String, PathBuf>::new();
 
     let mut summary = RunSummary {
+        other_files: count_other_files(items, &placements),
         dry_run: settings.dry_run,
         ..Default::default()
     };
@@ -236,10 +337,15 @@ pub fn start_run(
             continue;
         }
 
+        let (metadata, timezone_name) = metadata_by_source
+            .get(placement.src.as_str())
+            .map(|(metadata, timezone_name)| (Some(*metadata), *timezone_name))
+            .unwrap_or((None, None));
         match write_placement(
             settings,
             placement,
-            metadata_by_source.get(placement.src.as_str()).copied(),
+            metadata,
+            timezone_name,
             &mut exiftool,
             &mut processed_outputs,
         ) {
@@ -324,6 +430,32 @@ pub fn start_indexed_run(
     )
 }
 
+pub fn start_indexed_run_with_manifest(
+    app: &tauri::AppHandle,
+    settings: &PlannerSettings,
+    items: &[MediaItem],
+    placements: &[Placement],
+    input_locators: HashMap<String, InputLocator>,
+    archives_to_delete: HashSet<String>,
+    exiftool_path: &Path,
+    manifest: RunManifest,
+) -> Result<RunSummary, String> {
+    start_indexed_run_inner(
+        settings,
+        items,
+        placements,
+        input_locators,
+        archives_to_delete,
+        exiftool_path,
+        Some(manifest),
+        &send_archive_to_trash,
+        |progress| {
+            crate::events::emit_processing_progress(app, progress)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
 pub fn start_indexed_run_with_progress(
     settings: &PlannerSettings,
     items: &[MediaItem],
@@ -331,6 +463,54 @@ pub fn start_indexed_run_with_progress(
     input_locators: HashMap<String, InputLocator>,
     archives_to_delete: HashSet<String>,
     exiftool_path: &Path,
+    emit_progress: impl FnMut(&crate::events::ProcessingProgressEvent) -> Result<(), String>,
+) -> Result<RunSummary, String> {
+    start_indexed_run_inner(
+        settings,
+        items,
+        placements,
+        input_locators,
+        archives_to_delete,
+        exiftool_path,
+        None,
+        &send_archive_to_trash,
+        emit_progress,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn start_indexed_run_with_progress_and_deleter(
+    settings: &PlannerSettings,
+    items: &[MediaItem],
+    placements: &[Placement],
+    input_locators: HashMap<String, InputLocator>,
+    archives_to_delete: HashSet<String>,
+    exiftool_path: &Path,
+    send_to_trash: impl Fn(&Path) -> Result<(), String>,
+    emit_progress: impl FnMut(&crate::events::ProcessingProgressEvent) -> Result<(), String>,
+) -> Result<RunSummary, String> {
+    start_indexed_run_inner(
+        settings,
+        items,
+        placements,
+        input_locators,
+        archives_to_delete,
+        exiftool_path,
+        None,
+        &send_to_trash,
+        emit_progress,
+    )
+}
+
+fn start_indexed_run_inner(
+    settings: &PlannerSettings,
+    items: &[MediaItem],
+    placements: &[Placement],
+    input_locators: HashMap<String, InputLocator>,
+    archives_to_delete: HashSet<String>,
+    exiftool_path: &Path,
+    mut manifest: Option<RunManifest>,
+    send_to_trash: &dyn Fn(&Path) -> Result<(), String>,
     mut emit_progress: impl FnMut(&crate::events::ProcessingProgressEvent) -> Result<(), String>,
 ) -> Result<RunSummary, String> {
     let control = run_control();
@@ -341,17 +521,44 @@ pub fn start_indexed_run_with_progress(
 
     let mut tasks_by_source = HashMap::<String, usize>::new();
     let mut tasks = Vec::<ProcessingTask>::new();
+    let mut cached_placements = HashSet::new();
+    let mut cached_completed = 0_u32;
+    let mut completed_bytes = 0_u64;
     let items_by_source = items
         .iter()
         .map(|item| (item.source.as_str(), item))
         .collect::<HashMap<_, _>>();
-    for placement in placements {
+    for (placement_index, placement) in placements.iter().enumerate() {
         let Some(item) = items_by_source.get(placement.src.as_str()) else {
             return Err(format!(
                 "The planner returned an unknown source: {}",
                 placement.src
             ));
         };
+        let manifest_identity = manifest
+            .as_ref()
+            .filter(|_| !settings.dry_run)
+            .map(|_| placement_manifest_identity(item, placement, settings))
+            .transpose()?;
+        if let (Some(run_manifest), Some((source_key, placement_key))) =
+            (manifest.as_ref(), manifest_identity.as_ref())
+        {
+            if run_manifest.is_done_at_destination(
+                source_key,
+                placement_key,
+                Path::new(&placement.dest),
+            )? {
+                cached_placements.insert(placement_index);
+                cached_completed = cached_completed.saturating_add(1);
+                completed_bytes = completed_bytes.saturating_add(item.size_bytes);
+                continue;
+            }
+        }
+        if let (Some(run_manifest), Some((source_key, placement_key))) =
+            (manifest.as_mut(), manifest_identity.as_ref())
+        {
+            run_manifest.mark_pending(source_key, placement_key, &placement.dest)?;
+        }
         let task_index = if let Some(task_index) = tasks_by_source.get(&placement.src) {
             *task_index
         } else {
@@ -372,22 +579,31 @@ pub fn start_indexed_run_with_progress(
     tasks.sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
     let mut archive_remaining = HashMap::<String, usize>::new();
     let mut archive_success = HashMap::<String, bool>::new();
-    for placement in placements {
+    for (placement_index, placement) in placements.iter().enumerate() {
         let archive_path = input_locators
             .get(&placement.src)
             .ok_or_else(|| format!("No archive source was indexed for {}", placement.src))?
             .archive_path
             .clone();
         if archives_to_delete.contains(&archive_path) {
-            *archive_remaining.entry(archive_path.clone()).or_default() += 1;
+            let remaining = archive_remaining.entry(archive_path.clone()).or_default();
+            *remaining += 1;
             archive_success.entry(archive_path).or_insert(true);
+            if cached_placements.contains(&placement_index) {
+                *remaining = remaining.saturating_sub(1);
+            }
         }
     }
 
     let mut summary = RunSummary {
         planned: placements.len() as u32,
+        skipped: cached_completed,
         dry_run: settings.dry_run,
-        files_without_json: items.iter().filter(|item| !item.has_json).count() as u32,
+        files_without_json: items
+            .iter()
+            .filter(|item| (item.is_photo || item.is_video) && !item.has_json)
+            .count() as u32,
+        other_files: count_other_files(items, placements),
         live_photos_merged: if settings.merge_live && settings.live_style != "separate" {
             items
                 .iter()
@@ -399,8 +615,9 @@ pub fn start_indexed_run_with_progress(
         ..Default::default()
     };
     let state = RunStateStore::new_temp()?;
+    state.clear_summary()?;
     state.set("status", "running")?;
-    state.mark_progress(0, summary.planned, "planning")?;
+    state.mark_progress(cached_completed, summary.planned, "processing")?;
 
     let total_bytes = placements.iter().try_fold(0_u64, |total, placement| {
         let item = items_by_source
@@ -411,27 +628,27 @@ pub fn start_indexed_run_with_progress(
             .ok_or_else(|| "total processing size is too large to calculate".to_string())
     })?;
     let mut current_file = None;
-    let mut completed_bytes = 0_u64;
+    let mut completed = cached_completed;
     let mut last_emit = Instant::now() - Duration::from_secs(1);
     emit_indexed_progress(
         &mut emit_progress,
         &summary,
         current_file.as_deref(),
-        0,
+        completed,
         summary.planned,
         completed_bytes,
         total_bytes,
         Duration::ZERO,
     )?;
 
-    if settings.dry_run || tasks.is_empty() {
+    if settings.dry_run || placements.is_empty() {
         state.mark_progress(summary.planned, summary.planned, "complete")?;
         state.mark_finished(&summary)?;
         return Ok(summary);
     }
 
     let needs_exiftool = tasks.iter().any(|task| {
-        task.item.metadata.is_some() && supports_embedded_metadata(Path::new(&task.item.filename))
+        requires_exiftool_metadata(&task.item)
             || task.placements.iter().any(|placement| {
                 placement.tags.iter().any(|tag| {
                     tag.starts_with("LivePhotoIphone:") || tag.starts_with("LivePhotoAndroid:")
@@ -470,153 +687,271 @@ pub fn start_indexed_run_with_progress(
         }));
     }
     drop(result_sender);
-    for task in tasks {
-        task_sender
-            .send(task)
-            .map_err(|error| format!("queue processing work: {error}"))?;
-    }
-    drop(task_sender);
-
     let started = Instant::now();
-    let mut completed = 0_u32;
+    let task_feeder = thread::spawn(move || {
+        for task in tasks {
+            task_sender
+                .send(task)
+                .map_err(|error| format!("queue processing work: {error}"))?;
+        }
+        Ok::<(), String>(())
+    });
     let mut event_error = None;
-    for completion in result_receiver {
-        completed = completed.saturating_add(1);
-        current_file = Some(completion.item.filename.clone());
-        completed_bytes = completed_bytes.saturating_add(completion.item.size_bytes);
-        let archive_path = completion.archive_path.clone();
-        let output_succeeded = matches!(&completion.result, Ok(result) if !result.skipped);
-
-        if !completion.item.has_json {
-            add_attention(
-                &mut summary,
-                &completion.item,
-                Some(&completion.placement.dest),
-                "No JSON sidecar",
-                "no-json",
-            );
-        }
-        if let Some(warning) = completion.item.live_warning.as_ref() {
-            push_bounded(&mut summary.warnings, warning.clone());
-        }
-
-        match completion.result {
-            Ok(result) => {
-                if result.skipped {
-                    summary.skipped = summary.skipped.saturating_add(1);
-                    if result
-                        .warnings
-                        .iter()
-                        .any(|warning| warning.contains("already exists"))
-                    {
-                        summary.collisions = summary.collisions.saturating_add(1);
-                    }
-                    add_attention(
-                        &mut summary,
-                        &completion.item,
-                        Some(&completion.placement.dest),
-                        "Output was skipped",
-                        "skipped",
-                    );
-                } else {
-                    summary.processed = summary.processed.saturating_add(1);
-                    let metadata_failed = result
-                        .warnings
-                        .iter()
-                        .any(|warning| warning.starts_with("Could not write metadata"));
-                    if completion
-                        .item
-                        .metadata
-                        .as_ref()
-                        .and_then(TakeoutMetadata::taken_timestamp)
-                        .is_some()
-                    {
-                        summary.dates_restored = summary.dates_restored.saturating_add(1);
-                    }
-                    if !metadata_failed
-                        && settings.write_gps
-                        && crate::metadata::supports_embedded_metadata(Path::new(
-                            &completion.item.filename,
-                        ))
-                        && completion.item.metadata.as_ref().is_some_and(|metadata| {
-                            metadata.latitude.is_some() && metadata.longitude.is_some()
-                        })
-                    {
-                        summary.locations_added = summary.locations_added.saturating_add(1);
+    let mut manifest_error = None;
+    let mut run_error = None;
+    let output_root = settings
+        .output_root
+        .as_deref()
+        .map(PathBuf::from)
+        .or_else(|| {
+            placements
+                .first()
+                .and_then(|placement| Path::new(&placement.dest).parent())
+                .map(Path::to_path_buf)
+        });
+    let mut last_space_check = Instant::now() - Duration::from_secs(10);
+    loop {
+        let completion = match result_receiver.recv_timeout(Duration::from_millis(250)) {
+            Ok(completion) => Some(completion),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if let Some(completion) = completion {
+            completed = completed.saturating_add(1);
+            current_file = Some(completion.item.filename.clone());
+            completed_bytes = completed_bytes.saturating_add(completion.item.size_bytes);
+            let archive_path = completion.archive_path.clone();
+            let output_succeeded = matches!(&completion.result, Ok(result) if !result.skipped);
+            let manifest_identity = if manifest.is_some() {
+                match placement_manifest_identity(&completion.item, &completion.placement, settings)
+                {
+                    Ok(identity) => Some(identity),
+                    Err(error) => {
+                        manifest_error.get_or_insert(error);
+                        None
                     }
                 }
-                for warning in result.warnings {
-                    push_bounded(&mut summary.warnings, warning.clone());
-                    add_attention(
-                        &mut summary,
-                        &completion.item,
-                        Some(&completion.placement.dest),
-                        &warning,
-                        "warnings",
-                    );
-                }
-            }
-            Err(error)
-                if control
-                    .lock()
-                    .map_err(|lock_error| format!("run control is unavailable: {lock_error}"))?
-                    .is_cancelled() =>
-            {
-                let _ = error;
-                summary.cancelled = true;
-            }
-            Err(error) => {
-                summary.failed = summary.failed.saturating_add(1);
-                push_bounded(&mut summary.problems, error.clone());
+            } else {
+                None
+            };
+
+            if !completion.item.has_json && (completion.item.is_photo || completion.item.is_video) {
                 add_attention(
                     &mut summary,
                     &completion.item,
                     Some(&completion.placement.dest),
-                    &error,
-                    "failed",
+                    "No JSON sidecar",
+                    "no-json",
                 );
             }
-        }
-
-        if let Some(remaining) = archive_remaining.get_mut(&archive_path) {
-            if !output_succeeded {
-                archive_success.insert(archive_path.clone(), false);
+            if let Some(warning) = completion.item.live_warning.as_ref() {
+                push_bounded(&mut summary.warnings, warning.clone());
             }
-            *remaining = remaining.saturating_sub(1);
-            if *remaining == 0 && archive_success.get(&archive_path) == Some(&true) {
-                match delete_archives_after(settings, std::slice::from_ref(&archive_path)) {
-                    Ok(deleted) => {
-                        summary.archives_deleted = summary
-                            .archives_deleted
-                            .saturating_add(deleted.len() as u32);
+
+            match completion.result {
+                Ok(result) => {
+                    if result.skipped {
+                        summary.skipped = summary.skipped.saturating_add(1);
+                        if result
+                            .warnings
+                            .iter()
+                            .any(|warning| warning.contains("already exists"))
+                        {
+                            summary.collisions = summary.collisions.saturating_add(1);
+                        }
+                        add_attention(
+                            &mut summary,
+                            &completion.item,
+                            Some(&completion.placement.dest),
+                            "Output was skipped",
+                            "skipped",
+                        );
+                    } else {
+                        summary.processed = summary.processed.saturating_add(1);
+                        if let (Some(run_manifest), Some((source_key, placement_key))) =
+                            (manifest.as_mut(), manifest_identity.as_ref())
+                        {
+                            if let Err(error) = run_manifest.mark_done(
+                                source_key,
+                                placement_key,
+                                Path::new(&completion.placement.dest),
+                            ) {
+                                manifest_error.get_or_insert(error);
+                            }
+                        }
+                        let metadata_failed = result.warnings.iter().any(|warning| {
+                            warning.starts_with("Could not write metadata")
+                                || is_metadata_error_warning(warning)
+                        });
+                        if completion
+                            .item
+                            .metadata
+                            .as_ref()
+                            .and_then(TakeoutMetadata::taken_timestamp)
+                            .is_some()
+                        {
+                            summary.dates_restored = summary.dates_restored.saturating_add(1);
+                        }
+                        if !metadata_failed
+                            && settings.write_gps
+                            && crate::metadata::supports_embedded_metadata(Path::new(
+                                &completion.item.filename,
+                            ))
+                            && completion.item.metadata.as_ref().is_some_and(|metadata| {
+                                metadata.latitude.is_some() && metadata.longitude.is_some()
+                            })
+                        {
+                            summary.locations_added = summary.locations_added.saturating_add(1);
+                        }
                     }
-                    Err(error) => push_bounded(&mut summary.warnings, error),
+                    for warning in result.warnings {
+                        push_bounded(&mut summary.warnings, warning.clone());
+                        add_attention(
+                            &mut summary,
+                            &completion.item,
+                            Some(&completion.placement.dest),
+                            &warning,
+                            "warnings",
+                        );
+                    }
+                }
+                Err(error) => {
+                    let is_cancelled = match control.lock() {
+                        Ok(control) => control.is_cancelled(),
+                        Err(lock_error) => {
+                            run_error
+                                .get_or_insert(format!("run control is unavailable: {lock_error}"));
+                            false
+                        }
+                    };
+                    if is_cancelled {
+                        summary.cancelled = true;
+                    } else {
+                        summary.failed = summary.failed.saturating_add(1);
+                        push_bounded(&mut summary.problems, error.clone());
+                        add_attention(
+                            &mut summary,
+                            &completion.item,
+                            Some(&completion.placement.dest),
+                            &error,
+                            "failed",
+                        );
+                    }
+                }
+            }
+
+            if let Some(remaining) = archive_remaining.get_mut(&archive_path) {
+                if !output_succeeded {
+                    archive_success.insert(archive_path.clone(), false);
+                }
+                *remaining = remaining.saturating_sub(1);
+            }
+
+            if last_emit.elapsed() >= Duration::from_millis(500) || completed == summary.planned {
+                if let Err(error) = emit_indexed_progress(
+                    &mut emit_progress,
+                    &summary,
+                    current_file.as_deref(),
+                    completed,
+                    summary.planned,
+                    completed_bytes,
+                    total_bytes,
+                    started.elapsed(),
+                ) {
+                    event_error.get_or_insert(error);
+                } else {
+                    last_emit = Instant::now();
+                }
+                if let Err(error) = state.mark_progress(completed, summary.planned, "processing") {
+                    run_error.get_or_insert(error);
+                    if let Ok(control) = control.lock() {
+                        control.cancel();
+                    }
                 }
             }
         }
 
-        if last_emit.elapsed() >= Duration::from_millis(500) || completed == summary.planned {
-            if let Err(error) = emit_indexed_progress(
-                &mut emit_progress,
-                &summary,
-                current_file.as_deref(),
-                completed,
-                summary.planned,
-                completed_bytes,
-                total_bytes,
-                started.elapsed(),
-            ) {
-                event_error.get_or_insert(error);
-            } else {
-                last_emit = Instant::now();
+        if last_space_check.elapsed() >= Duration::from_secs(10) && run_error.is_none() {
+            last_space_check = Instant::now();
+            if let Some(path) = output_root.as_deref() {
+                match crate::platform::disk_space_bytes(path) {
+                    Ok((free_bytes, total_bytes)) => {
+                        let threshold = minimum_free_space(total_bytes);
+                        match control.lock() {
+                            Ok(control) if free_bytes < threshold && !control.is_paused() => {
+                                control.pause_for_space();
+                                push_bounded(
+                                    &mut summary.warnings,
+                                    format!(
+                                        "Processing paused because free space fell below {:.2} GB.",
+                                        threshold as f64 / 1_000_000_000.0
+                                    ),
+                                );
+                                if let Err(error) =
+                                    state.mark_progress(completed, summary.planned, "paused")
+                                {
+                                    run_error.get_or_insert(error);
+                                    control.cancel();
+                                }
+                            }
+                            Ok(control) if free_bytes >= threshold && control.is_space_paused() => {
+                                control.resume();
+                                push_bounded(
+                                    &mut summary.warnings,
+                                    "Processing resumed after free space recovered.".to_string(),
+                                );
+                                if let Err(error) =
+                                    state.mark_progress(completed, summary.planned, "processing")
+                                {
+                                    run_error.get_or_insert(error);
+                                    control.cancel();
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                run_error
+                                    .get_or_insert(format!("run control is unavailable: {error}"));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        run_error.get_or_insert(error);
+                        if let Ok(control) = control.lock() {
+                            control.cancel();
+                        }
+                    }
+                }
             }
-            state.mark_progress(completed, summary.planned, "processing")?;
         }
     }
+    let feeder_result = match task_feeder.join() {
+        Ok(result) => result,
+        Err(_) => Err("the processing task feeder stopped unexpectedly".to_string()),
+    };
+    let mut worker_error = None;
+    let mut worker_panicked = false;
     for worker in workers {
-        worker
-            .join()
-            .map_err(|_| "a processing worker stopped unexpectedly".to_string())??;
+        match worker.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                worker_error.get_or_insert(error);
+            }
+            Err(_) => worker_panicked = true,
+        }
+    }
+    if let Some(error) = worker_error {
+        return Err(error);
+    }
+    if worker_panicked {
+        return Err("a processing worker stopped unexpectedly".to_string());
+    }
+    feeder_result?;
+
+    if let Some(error) = run_error {
+        return Err(error);
+    }
+    if let Some(error) = manifest_error {
+        return Err(error);
     }
 
     if control
@@ -626,6 +961,32 @@ pub fn start_indexed_run_with_progress(
     {
         summary.paused = true;
     }
+    let can_delete_archives = settings.delete_archives_after
+        && summary.failed == 0
+        && !summary.cancelled
+        && !summary.paused
+        && event_error.is_none();
+    if can_delete_archives {
+        let archives_to_trash = archive_remaining
+            .iter()
+            .filter(|(archive, remaining)| {
+                **remaining == 0 && archive_success.get(*archive) == Some(&true)
+            })
+            .map(|(archive, _)| archive.clone())
+            .collect::<Vec<_>>();
+        for archive_path in &archives_to_trash {
+            match delete_archives_after_with(settings, std::slice::from_ref(archive_path), |path| {
+                send_to_trash(path)
+            }) {
+                Ok(deleted) => {
+                    summary.archives_deleted = summary
+                        .archives_deleted
+                        .saturating_add(deleted.len() as u32);
+                }
+                Err(error) => push_bounded(&mut summary.warnings, error),
+            }
+        }
+    }
     if archives_to_delete.iter().any(|archive| {
         archive_remaining.get(archive).copied().unwrap_or(0) > 0
             || archive_success.get(archive) == Some(&false)
@@ -634,6 +995,12 @@ pub fn start_indexed_run_with_progress(
             &mut summary.warnings,
             "One or more input archives were kept because not every output completed successfully."
                 .to_string(),
+        );
+    }
+    if settings.delete_archives_after && summary.failed > 0 && !archives_to_delete.is_empty() {
+        push_bounded(
+            &mut summary.warnings,
+            "Input archives were kept because the run finished with failed outputs.".to_string(),
         );
     }
     if summary.cancelled {
@@ -674,7 +1041,12 @@ struct PlacementCompletion {
     archive_path: String,
     placement: Placement,
     result: Result<PlacementResult, String>,
+    metadata_request: Option<MetadataWriteRequest>,
+    deferred_temp: Option<tempfile::TempPath>,
+    deferred_temp: Option<tempfile::TempPath>,
 }
+
+const PAUSED_WRITE_MARKER: &str = "Takeback paused before output could be finalized.";
 
 fn process_worker(
     receiver: Arc<Mutex<mpsc::Receiver<ProcessingTask>>>,
@@ -689,42 +1061,249 @@ fn process_worker(
     } else {
         None
     };
+    let mut zip_archives = HashMap::new();
+    let mut pending_metadata = Vec::<PlacementCompletion>::new();
+    let mut processed_outputs = HashMap::new();
     loop {
         let task = receiver
             .lock()
             .map_err(|error| format!("processing queue is unavailable: {error}"))?
             .recv();
         let Ok(task) = task else {
+            flush_metadata_batch(
+                &mut exiftool,
+                &sender,
+                &mut pending_metadata,
+                &mut processed_outputs,
+                &mut zip_archives,
+                &input_locators,
+            )?;
             return Ok(());
         };
-        let mut processed_outputs = HashMap::new();
-        for placement in task.placements {
-            let result = if run_control()
-                .lock()
-                .map_err(|error| format!("run control is unavailable: {error}"))?
-                .is_cancelled()
-            {
-                Err("Processing was cancelled.".to_string())
-            } else {
-                write_placement_with_sources(
+        processed_outputs.clear();
+        for (placement_index, placement) in task.placements.iter().cloned().enumerate() {
+            if placement_index > 0 && !pending_metadata.is_empty() {
+                flush_metadata_batch(
+                    &mut exiftool,
+                    &sender,
+                    &mut pending_metadata,
+                    &mut processed_outputs,
+                    &mut zip_archives,
+                    &input_locators,
+                )?;
+            }
+            let mut deferred_metadata = None;
+            let mut deferred_temp = None;
+            let result = loop {
+                if run_control()
+                    .lock()
+                    .map_err(|error| format!("run control is unavailable: {error}"))?
+                    .is_cancelled()
+                {
+                    break Err("Processing was cancelled.".to_string());
+                }
+                let result = write_placement_with_sources(
                     &settings,
                     &placement,
                     task.item.metadata.as_ref(),
+                    task.item.tz.as_deref(),
                     &mut exiftool,
+                    &mut zip_archives,
                     &mut processed_outputs,
                     &input_locators,
                     task.item.embedded_motion_video,
-                )
+                    true,
+                    &mut deferred_metadata,
+                    &mut deferred_temp,
+                );
+                match result {
+                    Err(error) if error.contains(PAUSED_WRITE_MARKER) => {
+                        deferred_metadata = None;
+                        deferred_temp = None;
+                        if let Err(error) = wait_for_run_resume() {
+                            break Err(error);
+                        }
+                    }
+                    result => break result,
+                }
             };
-            sender
-                .send(PlacementCompletion {
-                    item: task.item.clone(),
-                    archive_path: task.archive_path.clone(),
-                    placement,
-                    result,
-                })
-                .map_err(|error| format!("return processing result: {error}"))?;
+            let metadata_request = if result.is_ok() {
+                deferred_metadata
+            } else {
+                None
+            };
+            let deferred_temp = if metadata_request.is_some() {
+                deferred_temp
+            } else {
+                None
+            };
+            let completion = PlacementCompletion {
+                item: task.item.clone(),
+                archive_path: task.archive_path.clone(),
+                placement,
+                result,
+                metadata_request,
+                deferred_temp,
+            };
+            if completion.metadata_request.is_some() {
+                pending_metadata.push(completion);
+                if pending_metadata.len() >= crate::metadata::EXIFTOOL_BATCH_SIZE {
+                    flush_metadata_batch(
+                        &mut exiftool,
+                        &sender,
+                        &mut pending_metadata,
+                        &mut processed_outputs,
+                        &mut zip_archives,
+                        &input_locators,
+                    )?;
+                }
+            } else {
+                sender
+                    .send(completion)
+                    .map_err(|error| format!("return processing result: {error}"))?;
+            }
         }
+    }
+}
+
+fn flush_metadata_batch(
+    exiftool: &mut Option<ExifTool>,
+    sender: &mpsc::Sender<PlacementCompletion>,
+    pending: &mut Vec<PlacementCompletion>,
+    processed_outputs: &mut HashMap<String, PathBuf>,
+    zip_archives: &mut WorkerZipCache,
+    input_locators: &HashMap<String, InputLocator>,
+) -> Result<(), String> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let requests = pending
+        .iter()
+        .map(|completion| {
+            completion
+                .metadata_request
+                .clone()
+                .ok_or_else(|| "metadata batch is missing a write request".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcomes = match exiftool.as_mut() {
+        Some(exiftool) => exiftool.write_batch(&requests).unwrap_or_else(|error| {
+            vec![vec![format!("Error: could not write metadata batch: {error}")]; requests.len()]
+        }),
+        None => {
+            vec![
+                vec!["Error: ExifTool was not available for a metadata batch.".to_string(),];
+                requests.len()
+            ]
+        }
+    };
+
+    for (mut completion, warnings) in pending.drain(..).zip(outcomes) {
+        let metadata_errors = warnings
+            .iter()
+            .filter(|warning| is_metadata_error_warning(warning))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !metadata_errors.is_empty() {
+            let temp = completion
+                .deferred_temp
+                .as_ref()
+                .ok_or_else(|| "metadata batch is missing its temporary output".to_string())?;
+            let temp_path: &Path = temp.as_ref();
+            if let Err(error) = copy_source_into_temp(
+                &completion.item.source,
+                temp_path,
+                input_locators,
+                zip_archives,
+            ) {
+                completion.result = Err(format!(
+                    "metadata write failed: {}; restore output failed: {error}",
+                    metadata_errors.join("; ")
+                ));
+            } else if let Some(metadata) = completion.item.metadata.as_ref() {
+                if let Err(error) = set_taken_file_time(temp_path, metadata) {
+                    completion.result = Err(format!(
+                        "metadata write failed: {}; restore output time failed: {error}",
+                        metadata_errors.join("; ")
+                    ));
+                }
+            }
+            if let Ok(result) = &mut completion.result {
+                result.warnings.extend(warnings);
+                result.warnings.push(format!(
+                    "Could not write metadata to {}; the original file was preserved: {}",
+                    completion.placement.dest,
+                    metadata_errors.join("; ")
+                ));
+            }
+        } else if let Ok(result) = &mut completion.result {
+            result.warnings.extend(warnings);
+        }
+
+        if completion.result.is_ok() {
+            let control = run_control()
+                .lock()
+                .map_err(|error| format!("run control is unavailable: {error}"))?;
+            if control.is_cancelled() {
+                completion.result = Err("Processing was cancelled.".to_string());
+            }
+            let paused = control.is_paused();
+            drop(control);
+            if paused && completion.result.is_ok() {
+                if let Err(error) = wait_for_run_resume() {
+                    completion.result = Err(error);
+                }
+            }
+        }
+
+        if completion.result.is_ok() {
+            let temp = completion
+                .deferred_temp
+                .take()
+                .ok_or_else(|| "metadata batch is missing its temporary output".to_string())?;
+            let destination = Path::new(&completion.placement.dest);
+            let temp_display = temp.display().to_string();
+            if let Err(error) = temp.persist_noclobber(destination) {
+                completion.result = Err(format!(
+                    "Could not safely finalize temporary output {} as {} without replacing an existing file: {}",
+                    temp_display,
+                    destination.display(),
+                    error.error
+                ));
+            } else {
+                processed_outputs
+                    .insert(completion.placement.src.clone(), destination.to_path_buf());
+            }
+        }
+        completion.metadata_request = None;
+        completion.deferred_temp = None;
+        sender
+            .send(completion)
+            .map_err(|error| format!("return metadata batch results: {error}"))?;
+    }
+    Ok(())
+}
+
+fn is_metadata_error_warning(warning: &str) -> bool {
+    let lowercase = warning.to_ascii_lowercase();
+    warning.trim_start().starts_with("Error:")
+        || (lowercase.contains("files weren") && lowercase.contains("updated"))
+}
+
+fn wait_for_run_resume() -> Result<(), String> {
+    loop {
+        let control = run_control()
+            .lock()
+            .map_err(|error| format!("run control is unavailable: {error}"))?;
+        if control.is_cancelled() {
+            return Err("Processing was cancelled.".to_string());
+        }
+        if !control.is_paused() {
+            return Ok(());
+        }
+        drop(control);
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -792,6 +1371,53 @@ fn push_bounded(values: &mut Vec<String>, value: String) {
     }
 }
 
+fn count_other_files(items: &[MediaItem], placements: &[Placement]) -> u32 {
+    let placed_sources = placements
+        .iter()
+        .map(|placement| placement.src.as_str())
+        .collect::<HashSet<_>>();
+    items
+        .iter()
+        .filter(|item| {
+            !item.is_photo && !item.is_video && placed_sources.contains(item.source.as_str())
+        })
+        .count() as u32
+}
+
+fn requires_exiftool_metadata(item: &MediaItem) -> bool {
+    item.metadata.is_some()
+        && supports_embedded_metadata(Path::new(&item.filename))
+        && !is_large_metadata_video(Path::new(&item.filename), item.size_bytes)
+}
+
+fn placement_manifest_identity(
+    item: &MediaItem,
+    placement: &Placement,
+    settings: &PlannerSettings,
+) -> Result<(String, String), String> {
+    let output_root = settings
+        .output_root
+        .as_deref()
+        .map(Path::new)
+        .ok_or_else(|| "The output root is unavailable for the run manifest.".to_string())?;
+    let destination_directory = Path::new(&placement.dest)
+        .parent()
+        .ok_or_else(|| format!("output path has no parent: {}", placement.dest))?;
+    let kind = match placement.kind {
+        crate::planner::PlacementKind::Original => "original",
+        crate::planner::PlacementKind::Link => "link",
+        crate::planner::PlacementKind::Copy => "copy",
+    };
+    Ok((
+        manifest::source_key(&item.source, item.size_bytes),
+        manifest::placement_key(kind, &placement.tags, destination_directory, output_root),
+    ))
+}
+
+fn minimum_free_space(total_bytes: u64) -> u64 {
+    1_000_000_000_u64.max(total_bytes.saturating_mul(2) / 100)
+}
+
 #[derive(Debug, Default)]
 pub struct PlacementResult {
     pub skipped: bool,
@@ -803,17 +1429,24 @@ fn write_placement(
     settings: &PlannerSettings,
     placement: &Placement,
     metadata: Option<&TakeoutMetadata>,
+    timezone_name: Option<&str>,
     exiftool: &mut Option<ExifTool>,
     processed_outputs: &mut HashMap<String, PathBuf>,
 ) -> Result<PlacementResult, String> {
+    let mut zip_archives = HashMap::new();
     write_placement_with_sources(
         settings,
         placement,
         metadata,
+        timezone_name,
         exiftool,
+        &mut zip_archives,
         processed_outputs,
         &HashMap::new(),
         false,
+        false,
+        &mut None,
+        &mut None,
     )
 }
 
@@ -821,10 +1454,15 @@ fn write_placement_with_sources(
     settings: &PlannerSettings,
     placement: &Placement,
     metadata: Option<&TakeoutMetadata>,
+    timezone_name: Option<&str>,
     exiftool: &mut Option<ExifTool>,
+    zip_archives: &mut WorkerZipCache,
     processed_outputs: &mut HashMap<String, PathBuf>,
     input_locators: &HashMap<String, InputLocator>,
     embedded_motion_marker: bool,
+    batch_metadata: bool,
+    deferred_metadata: &mut Option<MetadataWriteRequest>,
+    deferred_temp: &mut Option<tempfile::TempPath>,
 ) -> Result<PlacementResult, String> {
     let src = Path::new(&placement.src);
     let dest = Path::new(&placement.dest);
@@ -900,7 +1538,7 @@ fn write_placement_with_sources(
             ));
         }
     } else {
-        copy_source_into_temp(&placement.src, tmp_path, input_locators)?;
+        copy_source_into_temp(&placement.src, tmp_path, input_locators, zip_archives)?;
     }
 
     if embedded_motion_marker {
@@ -917,30 +1555,52 @@ fn write_placement_with_sources(
 
     if metadata_output && linked_output.is_none() {
         if supports_embedded_metadata(dest) {
-            let writer = exiftool.as_mut().ok_or_else(|| {
-                "bundled ExifTool is not available for metadata writes".to_string()
-            })?;
-            match writer.write(
-                tmp_path,
-                metadata.ok_or_else(|| "missing Takeout metadata".to_string())?,
-                settings.time_zone,
-                settings.write_gps,
-                settings.write_descriptions,
-                settings.rate_favorites,
-            ) {
-                Ok(warnings) => result.warnings.extend(warnings),
-                Err(error) => {
-                    copy_source_into_temp(&placement.src, tmp_path, input_locators).map_err(|restore_error| {
-                        format!("metadata write failed: {error}; restore output failed: {restore_error}")
-                    })?;
-                    set_taken_file_time(
-                        tmp_path,
-                        metadata.ok_or_else(|| "missing Takeout metadata".to_string())?,
-                    )?;
-                    result.warnings.push(format!(
-                        "Could not write metadata to {}; the original file was preserved: {error}",
-                        dest.display()
-                    ));
+            let metadata = metadata.ok_or_else(|| "missing Takeout metadata".to_string())?;
+            let temp_size = fs::metadata(tmp_path)
+                .map_err(|error| {
+                    format!("inspect temporary output {}: {error}", tmp_path.display())
+                })?
+                .len();
+            if is_large_metadata_video(dest, temp_size) {
+                set_taken_file_time(tmp_path, metadata)?;
+                result.warnings.push(
+                    "ExifTool metadata rewrite was skipped for a video over 500 MB; only the file modified time was set when available."
+                        .to_string(),
+                );
+            } else if batch_metadata {
+                *deferred_metadata = Some(MetadataWriteRequest {
+                    path: tmp_path.to_path_buf(),
+                    metadata: metadata.clone(),
+                    time_zone: settings.time_zone,
+                    timezone_name: timezone_name.map(str::to_string),
+                    write_gps: settings.write_gps,
+                    write_descriptions: settings.write_descriptions,
+                    rate_favorites: settings.rate_favorites,
+                });
+            } else {
+                let writer = exiftool.as_mut().ok_or_else(|| {
+                    "bundled ExifTool is not available for metadata writes".to_string()
+                })?;
+                match writer.write(
+                    tmp_path,
+                    metadata,
+                    settings.time_zone,
+                    timezone_name,
+                    settings.write_gps,
+                    settings.write_descriptions,
+                    settings.rate_favorites,
+                ) {
+                    Ok(warnings) => result.warnings.extend(warnings),
+                    Err(error) => {
+                        copy_source_into_temp(&placement.src, tmp_path, input_locators, zip_archives).map_err(|restore_error| {
+                            format!("metadata write failed: {error}; restore output failed: {restore_error}")
+                        })?;
+                        set_taken_file_time(tmp_path, metadata)?;
+                        result.warnings.push(format!(
+                            "Could not write metadata to {}; the original file was preserved: {error}",
+                            dest.display()
+                        ));
+                    }
                 }
             }
         } else if let Some(metadata) = metadata {
@@ -987,7 +1647,7 @@ fn write_placement_with_sources(
         let video_temp = if input_locators.contains_key(video_source) {
             let temp = temp_path_for(dest)?;
             let video_temp_path: &Path = temp.as_ref();
-            copy_source_into_temp(video_source, video_temp_path, input_locators)?;
+            copy_source_into_temp(video_source, video_temp_path, input_locators, zip_archives)?;
             let duration_is_unknown = input_locators
                 .get(video_source)
                 .is_some_and(|locator| locator.video_duration_seconds.is_none());
@@ -1036,43 +1696,76 @@ fn write_placement_with_sources(
         set_taken_file_time(tmp_path, metadata)?;
     }
 
-    if run_control()
+    let control = run_control()
         .lock()
-        .map_err(|error| format!("run control is unavailable: {error}"))?
-        .is_cancelled()
-    {
+        .map_err(|error| format!("run control is unavailable: {error}"))?;
+    if control.is_cancelled() {
         return Err("Processing was cancelled.".to_string());
     }
+    if control.is_paused() {
+        return Err(PAUSED_WRITE_MARKER.to_string());
+    }
+    drop(control);
 
-    let temp_display = tmp_path.display().to_string();
-    tmp.persist_noclobber(dest).map_err(|error| {
-        format!(
-            "Could not safely finalize temporary output {} as {} without replacing an existing file: {}",
-            temp_display,
-            dest.display(),
-            error.error
-        )
-    })?;
+    if deferred_metadata.is_some() {
+        *deferred_temp = Some(tmp);
+    } else {
+        let temp_display = tmp_path.display().to_string();
+        tmp.persist_noclobber(dest).map_err(|error| {
+            format!(
+                "Could not safely finalize temporary output {} as {} without replacing an existing file: {}",
+                temp_display,
+                dest.display(),
+                error.error
+            )
+        })?;
 
-    if metadata_output {
-        processed_outputs.insert(placement.src.clone(), dest.to_path_buf());
+        if metadata_output {
+            processed_outputs.insert(placement.src.clone(), dest.to_path_buf());
+        }
     }
 
     Ok(result)
 }
 
+type WorkerZipCache = HashMap<String, ZipArchive<fs::File>>;
+
 fn copy_source_into_temp(
     source_key: &str,
     destination: &Path,
     input_locators: &HashMap<String, InputLocator>,
+    zip_archives: &mut WorkerZipCache,
 ) -> Result<(), String> {
     let output = fs::File::create(destination)
         .map_err(|error| format!("create temporary output {}: {error}", destination.display()))?;
     let mut output = CancelWriter { file: output };
     if let Some(locator) = input_locators.get(source_key) {
-        locator
-            .source
-            .copy_entry_to(&locator.entry_path, &mut output)?;
+        if !Path::new(&locator.archive_path).is_dir()
+            && Path::new(&locator.archive_path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+        {
+            if !zip_archives.contains_key(&locator.archive_path) {
+                let file = fs::File::open(&locator.archive_path)
+                    .map_err(|error| format!("open zip {}: {error}", locator.archive_path))?;
+                let archive = ZipArchive::new(file)
+                    .map_err(|error| format!("read zip {}: {error}", locator.archive_path))?;
+                zip_archives.insert(locator.archive_path.clone(), archive);
+            }
+            let archive = zip_archives
+                .get_mut(&locator.archive_path)
+                .ok_or_else(|| format!("zip cache unavailable: {}", locator.archive_path))?;
+            let mut entry = archive
+                .by_name(&locator.entry_path)
+                .map_err(|_| format!("zip entry not found: {}", locator.entry_path))?;
+            io::copy(&mut entry, &mut output)
+                .map_err(|error| format!("stream zip entry {}: {error}", locator.entry_path))?;
+        } else {
+            locator
+                .source
+                .copy_entry_to(&locator.entry_path, &mut output)?;
+        }
     } else {
         let mut source = fs::File::open(source_key)
             .map_err(|error| format!("open source file {source_key}: {error}"))?;
@@ -1091,21 +1784,20 @@ struct CancelWriter {
 
 impl Write for CancelWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        loop {
-            let control = run_control()
-                .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "run control is unavailable"))?;
-            if control.is_cancelled() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "processing was cancelled",
-                ));
-            }
-            if !control.is_paused() {
-                break;
-            }
-            drop(control);
-            thread::sleep(Duration::from_millis(100));
+        let control = run_control()
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "run control is unavailable"))?;
+        if control.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "processing was cancelled",
+            ));
+        }
+        if control.is_paused() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                PAUSED_WRITE_MARKER,
+            ));
         }
         self.file.write(buffer)
     }
@@ -1209,6 +1901,23 @@ pub fn delete_archives_after(
     settings: &PlannerSettings,
     paths: &[String],
 ) -> Result<Vec<String>, String> {
+    delete_archives_after_with(settings, paths, send_archive_to_trash)
+}
+
+fn send_archive_to_trash(path: &Path) -> Result<(), String> {
+    trash::delete(path).map_err(|error| {
+        format!(
+            "send archive to Recycle Bin/Trash {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn delete_archives_after_with(
+    settings: &PlannerSettings,
+    paths: &[String],
+    mut send_to_trash: impl FnMut(&Path) -> Result<(), String>,
+) -> Result<Vec<String>, String> {
     if !settings.delete_archives_after {
         return Ok(Vec::new());
     }
@@ -1227,7 +1936,7 @@ pub fn delete_archives_after(
             .is_some_and(|name| name.to_ascii_lowercase().ends_with(".tar.gz"));
         if matches!(lower.as_str(), "zip" | "tgz") || is_tar_gz {
             if p.exists() {
-                fs::remove_file(p).map_err(|e| format!("delete archive {}: {e}", p.display()))?;
+                send_to_trash(p)?;
                 deleted.push(path.clone());
             }
         }
@@ -1270,6 +1979,7 @@ mod tests {
             &settings,
             &placement,
             Some(&metadata),
+            None,
             &mut exiftool,
             &mut processed_outputs,
         )
@@ -1320,6 +2030,7 @@ mod tests {
             &PlannerSettings::default(),
             &placement,
             None,
+            None,
             &mut exiftool,
             &mut processed_outputs,
         )
@@ -1330,5 +2041,233 @@ mod tests {
             fs::read(destination).expect("read existing output"),
             b"existing contents"
         );
+    }
+
+    #[test]
+    fn zip_entries_reuse_a_worker_archive_cache() {
+        let directory = tempdir().expect("create test directory");
+        let archive_path = directory.path().join("takeout.zip");
+        let archive_file = fs::File::create(&archive_path).expect("create zip");
+        let mut archive = zip::ZipWriter::new(archive_file);
+        archive
+            .start_file("first.jpg", zip::write::FileOptions::default())
+            .expect("start first zip entry");
+        archive
+            .write_all(b"first image")
+            .expect("write first entry");
+        archive
+            .start_file("second.jpg", zip::write::FileOptions::default())
+            .expect("start second zip entry");
+        archive
+            .write_all(b"second image")
+            .expect("write second entry");
+        archive.finish().expect("finish zip");
+
+        let source: Arc<dyn Source> = Arc::new(crate::takeout::ZipSource {
+            path: archive_path.clone(),
+        });
+        let mut input_locators = HashMap::new();
+        for entry_path in ["first.jpg", "second.jpg"] {
+            input_locators.insert(
+                format!("takeout.zip::{entry_path}"),
+                InputLocator {
+                    source: source.clone(),
+                    archive_path: archive_path.to_string_lossy().to_string(),
+                    entry_path: entry_path.to_string(),
+                    video_duration_seconds: None,
+                },
+            );
+        }
+
+        let mut zip_archives = WorkerZipCache::default();
+        for entry_path in ["first.jpg", "second.jpg"] {
+            let source_key = format!("takeout.zip::{entry_path}");
+            let output_path = directory.path().join(format!("{entry_path}.out"));
+            copy_source_into_temp(
+                &source_key,
+                &output_path,
+                &input_locators,
+                &mut zip_archives,
+            )
+            .expect("copy zip entry");
+            assert_eq!(zip_archives.len(), 1);
+        }
+
+        assert_eq!(
+            fs::read(directory.path().join("first.jpg.out")).expect("read first output"),
+            b"first image"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("second.jpg.out")).expect("read second output"),
+            b"second image"
+        );
+    }
+
+    #[test]
+    fn indexed_run_returns_a_worker_startup_error() {
+        let directory = tempdir().expect("create test directory");
+        let source_root = directory.path().join("takeout");
+        fs::create_dir(&source_root).expect("create source folder");
+        fs::write(source_root.join("photo.jpg"), b"synthetic photo").expect("write source");
+        let source_key = "takeout::photo.jpg".to_string();
+        let item = MediaItem {
+            source: source_key.clone(),
+            filename: "photo.jpg".to_string(),
+            album: None,
+            additional_albums: Vec::new(),
+            date: None,
+            time: None,
+            tz: None,
+            size_bytes: 15,
+            is_photo: true,
+            is_video: false,
+            is_live: false,
+            live_pair_partner: None,
+            live_content_identifier: None,
+            live_pair_video: false,
+            embedded_motion_video: false,
+            live_warning: None,
+            favorite: false,
+            archived: false,
+            trashed: false,
+            edited: false,
+            has_json: true,
+            duplicate_of: None,
+            metadata: Some(TakeoutMetadata::default()),
+        };
+        let placement = Placement {
+            src: source_key.clone(),
+            dest: directory
+                .path()
+                .join("output.jpg")
+                .to_string_lossy()
+                .to_string(),
+            kind: PlacementKind::Original,
+            tags: Vec::new(),
+        };
+        let source: Arc<dyn Source> = crate::takeout::create_source(&source_root)
+            .expect("create folder source")
+            .into();
+        let mut input_locators = HashMap::new();
+        input_locators.insert(
+            source_key,
+            InputLocator {
+                source,
+                archive_path: source_root.to_string_lossy().to_string(),
+                entry_path: "photo.jpg".to_string(),
+                video_duration_seconds: None,
+            },
+        );
+        let missing_exiftool = directory.path().join("missing-exiftool.exe");
+        let expected_error = match ExifTool::new(&missing_exiftool) {
+            Ok(_) => panic!("missing ExifTool unexpectedly started"),
+            Err(error) => error,
+        };
+
+        let result = start_indexed_run_with_progress(
+            &PlannerSettings::default(),
+            &[item],
+            &[placement],
+            input_locators,
+            HashSet::new(),
+            &missing_exiftool,
+            |_| Ok(()),
+        );
+
+        assert_eq!(
+            result.expect_err("worker startup should fail"),
+            expected_error
+        );
+    }
+
+    #[test]
+    fn indexed_run_skips_a_manifest_output_with_matching_size() {
+        let directory = tempdir().expect("create test directory");
+        let source_root = directory.path().join("takeout");
+        let output_root = directory.path().join("library");
+        fs::create_dir(&source_root).expect("create source folder");
+        fs::create_dir(&output_root).expect("create output folder");
+        fs::write(source_root.join("photo.jpg"), b"photo").expect("write source");
+        let destination = output_root.join("photo.jpg");
+        fs::write(&destination, b"saved").expect("write completed output");
+        let source_key = "takeout::photo.jpg".to_string();
+        let item = MediaItem {
+            source: source_key.clone(),
+            filename: "photo.jpg".to_string(),
+            album: None,
+            additional_albums: Vec::new(),
+            date: None,
+            time: None,
+            tz: None,
+            size_bytes: 5,
+            is_photo: true,
+            is_video: false,
+            is_live: false,
+            live_pair_partner: None,
+            live_content_identifier: None,
+            live_pair_video: false,
+            embedded_motion_video: false,
+            live_warning: None,
+            favorite: false,
+            archived: false,
+            trashed: false,
+            edited: false,
+            has_json: true,
+            duplicate_of: None,
+            metadata: None,
+        };
+        let placement = Placement {
+            src: source_key.clone(),
+            dest: destination.to_string_lossy().to_string(),
+            kind: PlacementKind::Original,
+            tags: Vec::new(),
+        };
+        let mut settings = PlannerSettings::default();
+        settings.output_root = Some(output_root.to_string_lossy().to_string());
+        let mut manifest =
+            RunManifest::open(&directory.path().join("manifest.sqlite"), &output_root)
+                .expect("open manifest");
+        let (manifest_source, manifest_placement) =
+            placement_manifest_identity(&item, &placement, &settings)
+                .expect("create manifest identity");
+        manifest
+            .mark_done(&manifest_source, &manifest_placement, &destination)
+            .expect("record completed output");
+        let source: Arc<dyn Source> = crate::takeout::create_source(&source_root)
+            .expect("create folder source")
+            .into();
+        let input_locators = HashMap::from([(
+            source_key,
+            InputLocator {
+                source,
+                archive_path: source_root.to_string_lossy().to_string(),
+                entry_path: "photo.jpg".to_string(),
+                video_duration_seconds: None,
+            },
+        )]);
+
+        let summary = start_indexed_run_inner(
+            &settings,
+            &[item],
+            &[placement],
+            input_locators,
+            HashSet::new(),
+            Path::new(""),
+            Some(manifest),
+            &send_archive_to_trash,
+            |_| Ok(()),
+        )
+        .expect("resume completed run");
+
+        assert_eq!(summary.planned, 1);
+        assert_eq!(summary.processed, 0);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(fs::read(destination).expect("read output"), b"saved");
+    }
+
+    #[test]
+    fn free_space_threshold_is_the_larger_of_one_gb_and_two_percent() {
+        assert_eq!(minimum_free_space(10_000_000_000), 1_000_000_000);
+        assert_eq!(minimum_free_space(200_000_000_000), 4_000_000_000);
     }
 }

@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use chrono::Datelike;
+
+use crate::manifest;
 use crate::metadata::TakeoutMetadata;
 use crate::settings::{self, Settings};
 
@@ -203,6 +206,10 @@ pub struct MediaItem {
     pub additional_albums: Vec<String>,
     pub date: Option<String>,
     #[serde(default)]
+    pub time: Option<String>,
+    #[serde(default)]
+    pub tz: Option<String>,
+    #[serde(default)]
     pub size_bytes: u64,
     pub is_photo: bool,
     pub is_video: bool,
@@ -345,6 +352,8 @@ pub fn preview(settings: &PlannerSettings) -> Vec<String> {
             album: Some("Paris trip".to_string()),
             additional_albums: Vec::new(),
             date: Some("2024-05-16".to_string()),
+            time: None,
+            tz: None,
             size_bytes: 0,
             is_photo: true,
             is_video: false,
@@ -368,6 +377,8 @@ pub fn preview(settings: &PlannerSettings) -> Vec<String> {
             album: None,
             additional_albums: Vec::new(),
             date: Some("2024-05-16".to_string()),
+            time: None,
+            tz: None,
             size_bytes: 0,
             is_photo: false,
             is_video: true,
@@ -398,12 +409,122 @@ pub fn plan(items: &[MediaItem], settings: &PlannerSettings) -> Vec<Placement> {
     plan_with_root(items, settings, Path::new(&output_root), &HashSet::new())
 }
 
+pub fn destination_directories(
+    items: &[MediaItem],
+    settings: &PlannerSettings,
+    output_root: &Path,
+) -> HashSet<PathBuf> {
+    let mut directories = HashSet::new();
+    for item in items {
+        if item.trashed && matches!(settings.trashed, TrashedMode::Skip) {
+            continue;
+        }
+        if settings.ignore_duplicates && item.duplicate_of.is_some() {
+            continue;
+        }
+        if settings.merge_live
+            && settings.live_style == "androidMotionPhoto"
+            && item.live_pair_video
+        {
+            continue;
+        }
+        if !item.is_photo && !item.is_video {
+            directories.insert(folder_path(output_root, &["Other".to_string()]));
+            continue;
+        }
+        if matches!(settings.edited_versions, EditedVersions::Originals) && item.edited {
+            continue;
+        }
+        if matches!(settings.edited_versions, EditedVersions::Edited) && !item.edited {
+            continue;
+        }
+        if item.trashed && matches!(settings.trashed, TrashedMode::OwnFolder) {
+            directories.insert(folder_path(output_root, &["Trash".to_string()]));
+            continue;
+        }
+        if !item.has_json {
+            if matches!(settings.no_json, NoJsonMode::Leave) {
+                continue;
+            }
+            directories.insert(folder_path(output_root, &no_json_folders(item, settings)));
+            continue;
+        }
+
+        directories.insert(folder_path(
+            output_root,
+            &main_destination_folders(item, settings),
+        ));
+
+        let albums = item_albums(item);
+        if matches!(settings.album_mode, AlbumMode::Link | AlbumMode::Copy) {
+            for album_name in &albums {
+                let mut folders = album_folders(
+                    album_name,
+                    organization_date(item, settings).as_deref(),
+                    settings.album_loc,
+                );
+                append_type_folders(&mut folders, item, settings);
+                directories.insert(folder_path(output_root, &folders));
+            }
+        } else if matches!(settings.album_mode, AlbumMode::Move)
+            && matches!(settings.multi_album, MultiAlbumMode::All)
+        {
+            let primary_album = item.album.as_deref().map(sanitize_file_part);
+            for album_name in albums.iter().filter(|album_name| {
+                !primary_album
+                    .as_ref()
+                    .is_some_and(|primary| primary.eq_ignore_ascii_case(album_name))
+            }) {
+                let mut folders = album_folders(
+                    album_name,
+                    organization_date(item, settings).as_deref(),
+                    settings.album_loc,
+                );
+                append_type_folders(&mut folders, item, settings);
+                directories.insert(folder_path(output_root, &folders));
+            }
+        }
+
+        if matches!(
+            settings.favorites_mode,
+            FavoritesMode::Link | FavoritesMode::Copy
+        ) && item.favorite
+        {
+            directories.insert(folder_path(output_root, &["Favorites".to_string()]));
+        }
+        if matches!(settings.edited_mode, EditedMode::Link | EditedMode::Copy) && item.edited {
+            directories.insert(folder_path(output_root, &["Edited".to_string()]));
+        }
+    }
+    directories
+}
+
 pub fn plan_with_root(
     items: &[MediaItem],
     settings: &PlannerSettings,
     output_root: &Path,
     existing_paths: &HashSet<String>,
 ) -> Vec<Placement> {
+    plan_with_root_and_manifest(
+        items,
+        settings,
+        output_root,
+        existing_paths,
+        &HashMap::new(),
+    )
+}
+
+pub fn plan_with_root_and_manifest(
+    items: &[MediaItem],
+    settings: &PlannerSettings,
+    output_root: &Path,
+    existing_paths: &HashSet<String>,
+    manifest_destinations: &HashMap<String, String>,
+) -> Vec<Placement> {
+    let mut items_by_source = HashMap::with_capacity(items.len());
+    for item in items {
+        items_by_source.entry(item.source.as_str()).or_insert(item);
+    }
     let mut placements = Vec::new();
     let mut occupied = existing_paths
         .iter()
@@ -426,6 +547,20 @@ pub fn plan_with_root(
             continue;
         }
 
+        if !item.is_photo && !item.is_video {
+            if let Some(placement) = original_placement(
+                item,
+                output_root,
+                &["Other".to_string()],
+                settings,
+                &mut occupied,
+                manifest_destinations,
+            ) {
+                placements.push(placement);
+            }
+            continue;
+        }
+
         if matches!(settings.edited_versions, EditedVersions::Originals) && item.edited {
             continue;
         }
@@ -440,6 +575,7 @@ pub fn plan_with_root(
                 &["Trash".to_string()],
                 settings,
                 &mut occupied,
+                manifest_destinations,
             ) {
                 placements.push(placement);
             }
@@ -449,40 +585,30 @@ pub fn plan_with_root(
             if matches!(settings.no_json, NoJsonMode::Leave) {
                 continue;
             }
+            let folders = no_json_folders(item, settings);
             if let Some(placement) = original_placement(
                 item,
                 output_root,
-                &["Unsorted".to_string()],
+                &folders,
                 settings,
                 &mut occupied,
+                manifest_destinations,
             ) {
                 placements.push(placement);
             }
             continue;
         }
 
-        let mut main_folders = if item.archived && settings.archive_folder {
-            vec!["Archive".to_string()]
-        } else {
-            normal_folders(item, settings)
-        };
-        let mut main_is_flat = item.archived && settings.archive_folder;
+        let main_folders = main_destination_folders(item, settings);
 
-        if item.favorite && matches!(settings.favorites_mode, FavoritesMode::Move) {
-            main_folders = vec!["Favorites".to_string()];
-            main_is_flat = true;
-        }
-        if item.edited && matches!(settings.edited_mode, EditedMode::Move) {
-            main_folders = vec!["Edited".to_string()];
-            main_is_flat = true;
-        }
-        if !main_is_flat {
-            append_type_folders(&mut main_folders, item, settings);
-        }
-
-        if let Some(placement) =
-            original_placement(item, output_root, &main_folders, settings, &mut occupied)
-        {
+        if let Some(placement) = original_placement(
+            item,
+            output_root,
+            &main_folders,
+            settings,
+            &mut occupied,
+            manifest_destinations,
+        ) {
             placements.push(placement);
         }
 
@@ -508,6 +634,7 @@ pub fn plan_with_root(
                     Some(album_name),
                     settings,
                     &mut occupied,
+                    manifest_destinations,
                 ) {
                     placements.push(placement);
                 }
@@ -515,7 +642,12 @@ pub fn plan_with_root(
         } else if matches!(settings.album_mode, AlbumMode::Move)
             && matches!(settings.multi_album, MultiAlbumMode::All)
         {
-            for album_name in albums.iter().skip(1) {
+            let primary_album = item.album.as_deref().map(sanitize_file_part);
+            for album_name in albums.iter().filter(|album_name| {
+                !primary_album
+                    .as_ref()
+                    .is_some_and(|primary| primary.eq_ignore_ascii_case(album_name))
+            }) {
                 let mut album_folders = album_folders(
                     album_name,
                     organization_date(item, settings).as_deref(),
@@ -530,6 +662,7 @@ pub fn plan_with_root(
                     Some(album_name),
                     settings,
                     &mut occupied,
+                    manifest_destinations,
                 ) {
                     placements.push(placement);
                 }
@@ -554,6 +687,7 @@ pub fn plan_with_root(
                 None,
                 settings,
                 &mut occupied,
+                manifest_destinations,
             ) {
                 placements.push(placement);
             }
@@ -573,6 +707,7 @@ pub fn plan_with_root(
                 None,
                 settings,
                 &mut occupied,
+                manifest_destinations,
             ) {
                 placements.push(placement);
             }
@@ -580,7 +715,7 @@ pub fn plan_with_root(
     }
 
     for placement in &mut placements {
-        let Some(item) = items.iter().find(|item| item.source == placement.src) else {
+        let Some(item) = items_by_source.get(placement.src.as_str()).copied() else {
             continue;
         };
         if settings.merge_live {
@@ -626,20 +761,64 @@ fn item_albums(item: &MediaItem) -> Vec<String> {
 }
 
 fn normal_folders(item: &MediaItem, settings: &PlannerSettings) -> Vec<String> {
+    match (item.album.as_deref(), settings.album_mode) {
+        (Some(album), AlbumMode::Move) => album_folders(
+            album,
+            organization_date(item, settings).as_deref(),
+            settings.album_loc,
+        ),
+        _ => date_folders(item, settings),
+    }
+}
+
+fn no_json_folders(item: &MediaItem, settings: &PlannerSettings) -> Vec<String> {
+    let mut folders = vec!["Unsorted".to_string()];
+    if matches!(settings.no_date, NoDateMode::FileName) {
+        if let Some(date) = date_from_filename(&item.filename) {
+            folders.extend(
+                build_date_path(Some(&date), settings.date_folders)
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_string),
+            );
+        }
+    }
+    folders
+}
+
+fn main_destination_folders(item: &MediaItem, settings: &PlannerSettings) -> Vec<String> {
+    let mut folders = if item.archived && settings.archive_folder {
+        vec!["Archive".to_string()]
+    } else {
+        normal_folders(item, settings)
+    };
+    let mut is_flat = item.archived && settings.archive_folder;
+    if item.favorite && matches!(settings.favorites_mode, FavoritesMode::Move) {
+        folders = vec!["Favorites".to_string()];
+        is_flat = true;
+    }
+    if item.edited && matches!(settings.edited_mode, EditedMode::Move) {
+        folders = vec!["Edited".to_string()];
+        is_flat = true;
+    }
+    if !is_flat {
+        append_type_folders(&mut folders, item, settings);
+    }
+    folders
+}
+
+fn date_folders(item: &MediaItem, settings: &PlannerSettings) -> Vec<String> {
     let date = organization_date(item, settings);
     let date_mode = if date.is_none() && matches!(settings.no_date, NoDateMode::Blank) {
         DateFolderMode::Off
     } else {
         settings.date_folders
     };
-    match (item.album.as_deref(), settings.album_mode) {
-        (Some(album), AlbumMode::Move) => album_folders(album, date.as_deref(), settings.album_loc),
-        _ => build_date_path(date.as_deref(), date_mode)
-            .split('/')
-            .filter(|part| !part.is_empty())
-            .map(str::to_string)
-            .collect(),
-    }
+    build_date_path(date.as_deref(), date_mode)
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn album_folders(album: &str, date: Option<&str>, location: AlbumLocation) -> Vec<String> {
@@ -668,8 +847,25 @@ fn original_placement(
     folders: &[String],
     settings: &PlannerSettings,
     occupied: &mut HashSet<String>,
+    manifest_destinations: &HashMap<String, String>,
 ) -> Option<Placement> {
     let directory = folder_path(output_root, folders);
+    if let Some(destination) = manifest_destination(
+        item,
+        "original",
+        &[],
+        &directory,
+        output_root,
+        occupied,
+        manifest_destinations,
+    ) {
+        return Some(Placement {
+            src: item.source.clone(),
+            dest: destination,
+            kind: PlacementKind::Original,
+            tags: vec![],
+        });
+    }
     let filename = unique_path_name(&directory, item, None, settings, occupied)?;
     Some(Placement {
         src: item.source.clone(),
@@ -687,20 +883,63 @@ fn extra_placement(
     album_override: Option<&str>,
     settings: &PlannerSettings,
     occupied: &mut HashSet<String>,
+    manifest_destinations: &HashMap<String, String>,
 ) -> Option<Placement> {
     let directory = folder_path(output_root, folders);
-    let filename = unique_path_name(&directory, item, album_override, settings, occupied)?;
     let label = match kind {
         PlacementKind::Link => "Link",
         PlacementKind::Copy => "Copy",
         PlacementKind::Original => "",
     };
+    let tags = vec![label.to_string()];
+    if let Some(destination) = manifest_destination(
+        item,
+        label,
+        &tags,
+        &directory,
+        output_root,
+        occupied,
+        manifest_destinations,
+    ) {
+        return Some(Placement {
+            src: item.source.clone(),
+            dest: destination,
+            kind,
+            tags,
+        });
+    }
+    let filename = unique_path_name(&directory, item, album_override, settings, occupied)?;
     Some(Placement {
         src: item.source.clone(),
         dest: directory.join(filename).to_string_lossy().into_owned(),
         kind,
-        tags: vec![label.to_string()],
+        tags,
     })
+}
+
+fn manifest_destination(
+    item: &MediaItem,
+    kind: &str,
+    tags: &[String],
+    directory: &Path,
+    output_root: &Path,
+    occupied: &mut HashSet<String>,
+    manifest_destinations: &HashMap<String, String>,
+) -> Option<String> {
+    let source_key = manifest::source_key(&item.source, item.size_bytes);
+    let placement_key = manifest::placement_key(kind, tags, directory, output_root);
+    let destination =
+        manifest_destinations.get(&manifest::lookup_key(&source_key, &placement_key))?;
+    let destination_path = Path::new(destination);
+    let parent = destination_path.parent()?;
+    if normalized_path_key(&parent.to_string_lossy())
+        != normalized_path_key(&directory.to_string_lossy())
+    {
+        return None;
+    }
+    let filename = destination_path.file_name()?;
+    occupied.insert(normalized_path_key(&destination_path.to_string_lossy()));
+    Some(directory.join(filename).to_string_lossy().into_owned())
 }
 
 fn folder_path(output_root: &Path, folders: &[String]) -> PathBuf {
@@ -829,17 +1068,8 @@ fn rename_from_setting(
 }
 
 fn item_date_time(item: &MediaItem, settings: &PlannerSettings) -> (String, String) {
-    if let Some(timestamp) = item
-        .metadata
-        .as_ref()
-        .and_then(TakeoutMetadata::taken_timestamp)
-    {
-        if let Some(datetime) = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0) {
-            return (
-                datetime.format("%Y-%m-%d").to_string(),
-                datetime.format("%H%M%S").to_string(),
-            );
-        }
+    if let (Some(date), Some(time)) = (item.date.as_ref(), item.time.as_ref()) {
+        return (date.clone(), time.clone());
     }
     let date = organization_date(item, settings).unwrap_or_else(|| "Unknown".to_string());
     let date = date.get(..10).unwrap_or(&date).to_string();
@@ -854,33 +1084,44 @@ fn organization_date(item: &MediaItem, settings: &PlannerSettings) -> Option<Str
 }
 
 fn date_from_filename(filename: &str) -> Option<String> {
+    let current_year = chrono::Utc::now().year();
     let bytes = filename.as_bytes();
-    for (index, window) in bytes.windows(10).enumerate() {
-        if window[4] == b'-' || window[4] == b'_' {
-            if window[..4].iter().all(u8::is_ascii_digit)
-                && window[5] == window[4]
-                && window[5..7].iter().all(u8::is_ascii_digit)
-                && matches!(window[7], b'-' | b'_')
-                && window[8..10].iter().all(u8::is_ascii_digit)
+    for window in bytes.windows(10) {
+        if matches!(window[4], b'-' | b'_')
+            && window[7] == window[4]
+            && window[..4].iter().all(u8::is_ascii_digit)
+            && window[5..7].iter().all(u8::is_ascii_digit)
+            && window[8..10].iter().all(u8::is_ascii_digit)
+        {
+            if let Some(date) =
+                parse_filename_date(&window[..4], &window[5..7], &window[8..10], current_year)
             {
-                let year = std::str::from_utf8(&window[..4]).ok()?;
-                let month =
-                    u8::from_str_radix(std::str::from_utf8(&window[5..7]).ok()?, 10).ok()?;
-                let day = u8::from_str_radix(std::str::from_utf8(&window[8..10]).ok()?, 10).ok()?;
-                if (1..=12).contains(&month) && (1..=31).contains(&day) {
-                    return Some(format!("{year}-{month:02}-{day:02}"));
-                }
+                return Some(date);
             }
-        } else if index + 8 <= bytes.len() && window[..8].iter().all(u8::is_ascii_digit) {
-            let year = std::str::from_utf8(&window[..4]).ok()?;
-            let month = u8::from_str_radix(std::str::from_utf8(&window[4..6]).ok()?, 10).ok()?;
-            let day = u8::from_str_radix(std::str::from_utf8(&window[6..8]).ok()?, 10).ok()?;
-            if (1..=12).contains(&month) && (1..=31).contains(&day) {
-                return Some(format!("{year}-{month:02}-{day:02}"));
+        }
+    }
+    for window in bytes.windows(8) {
+        if window.iter().all(u8::is_ascii_digit) {
+            if let Some(date) =
+                parse_filename_date(&window[..4], &window[4..6], &window[6..8], current_year)
+            {
+                return Some(date);
             }
         }
     }
     None
+}
+
+fn parse_filename_date(year: &[u8], month: &[u8], day: &[u8], current_year: i32) -> Option<String> {
+    let year = i32::from_str_radix(std::str::from_utf8(year).ok()?, 10).ok()?;
+    let month = u8::from_str_radix(std::str::from_utf8(month).ok()?, 10).ok()?;
+    let day = u8::from_str_radix(std::str::from_utf8(day).ok()?, 10).ok()?;
+    if !(1990..=current_year + 1).contains(&year)
+        || chrono::NaiveDate::from_ymd_opt(year, month.into(), day.into()).is_none()
+    {
+        return None;
+    }
+    Some(format!("{year}-{month:02}-{day:02}"))
 }
 
 fn split_extension(filename: &str) -> (&str, &str) {
@@ -924,14 +1165,15 @@ fn normalized_path_key(path: &str) -> String {
 fn sanitize_file_part(part: &str) -> String {
     let mut cleaned: String = part
         .chars()
-        .map(|c| match c {
+        .filter(|character| !character.is_control())
+        .map(|character| match character {
             '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
-            _ => c,
+            _ => character,
         })
         .collect();
 
     cleaned = cleaned
-        .trim_matches(|c: char| c == '.' || c == ' ' || c == '\0')
+        .trim_matches(|c: char| c == '.' || c == ' ')
         .to_string();
     if cleaned.is_empty() {
         cleaned = "photo".to_string();
@@ -951,15 +1193,19 @@ fn sanitize_file_part(part: &str) -> String {
         cleaned = format!("_{}", cleaned);
     }
 
-    if cleaned.len() > 255 {
-        let mut end = 255;
-        while !cleaned.is_char_boundary(end) {
-            end -= 1;
-        }
-        cleaned.truncate(end);
+    let (stem, extension) = split_extension(&cleaned);
+    let suffix = if extension.is_empty() {
+        String::new()
+    } else {
+        format!(".{extension}")
+    };
+    let max_stem_bytes = 255_usize.saturating_sub(suffix.len());
+    let mut stem = stem.to_string();
+    while stem.len() > max_stem_bytes {
+        stem.pop();
     }
 
-    cleaned
+    format!("{stem}{suffix}")
 }
 
 #[cfg(test)]
@@ -974,6 +1220,8 @@ mod tests {
             album: Some("Paris trip".to_string()),
             additional_albums: Vec::new(),
             date: Some("2024-05-16".to_string()),
+            time: None,
+            tz: None,
             size_bytes: 0,
             is_photo: true,
             is_video: false,
@@ -1002,6 +1250,47 @@ mod tests {
         let settings = PlannerSettings::default();
         let root = effective_output_root(settings.output_root.as_deref());
         assert_eq!(root, "Pictures/Photo Library");
+    }
+
+    #[test]
+    fn planner_reuses_manifest_destinations_before_numbering_collisions() {
+        let output_root = Path::new("C:/Photo Library");
+        let mut settings = PlannerSettings::default();
+        settings.output_root = Some(output_root.to_string_lossy().to_string());
+        let item = sample_item("IMG_001.jpg");
+        let destination_directory = output_root.join("Paris trip");
+        let saved_destination = destination_directory.join("IMG_001-3.jpg");
+        let source_key = manifest::source_key(&item.source, item.size_bytes);
+        let placement_key =
+            manifest::placement_key("original", &[], &destination_directory, output_root);
+        let manifest_destinations = HashMap::from([(
+            manifest::lookup_key(&source_key, &placement_key),
+            saved_destination.to_string_lossy().to_string(),
+        )]);
+        let existing = HashSet::from([
+            destination_directory
+                .join("IMG_001.jpg")
+                .to_string_lossy()
+                .to_lowercase(),
+            saved_destination
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_lowercase(),
+        ]);
+
+        let placements = plan_with_root_and_manifest(
+            &[item],
+            &settings,
+            output_root,
+            &existing,
+            &manifest_destinations,
+        );
+
+        assert_eq!(placements.len(), 1);
+        assert_eq!(
+            placements[0].dest.replace('\\', "/"),
+            saved_destination.to_string_lossy().replace('\\', "/")
+        );
     }
 
     #[test]
@@ -1197,6 +1486,108 @@ mod tests {
     }
 
     #[test]
+    fn no_json_filename_dates_are_used_for_date_folders() {
+        let mut item = sample_item("IMG_20240516_photo.jpg");
+        item.has_json = false;
+        item.date = None;
+        let placements = plan(
+            &[item],
+            &PlannerSettings {
+                album_mode: AlbumMode::Off,
+                no_json: NoJsonMode::Unsorted,
+                no_date: NoDateMode::FileName,
+                ..PlannerSettings::default()
+            },
+        );
+
+        assert!(placements.iter().any(|placement| destination_ends_with(
+            &placement.dest,
+            "Unsorted/2024/05/IMG_20240516_photo.jpg"
+        )));
+    }
+
+    #[test]
+    fn destination_directories_cover_every_planned_placement() {
+        let mut archived = sample_item("archived.jpg");
+        archived.archived = true;
+        archived.favorite = true;
+        archived.edited = true;
+        let mut no_json = sample_item("IMG_20240516.jpg");
+        no_json.has_json = false;
+        let mut other = sample_item("notes.bin");
+        other.is_photo = false;
+        other.is_video = false;
+        let mut trashed = sample_item("trashed.jpg");
+        trashed.trashed = true;
+        let items = [archived, no_json, other, trashed];
+        let settings = PlannerSettings {
+            album_mode: AlbumMode::Copy,
+            favorites_mode: FavoritesMode::Link,
+            edited_mode: EditedMode::Copy,
+            trashed: TrashedMode::OwnFolder,
+            split_by_type: SplitByType {
+                photos: true,
+                videos: true,
+                live: true,
+            },
+            ..PlannerSettings::default()
+        };
+        let root = Path::new("Pictures/Photo Library");
+        let directories = destination_directories(&items, &settings, root);
+        let placements = plan_with_root(&items, &settings, root, &HashSet::new());
+
+        assert!(placements.iter().all(|placement| {
+            Path::new(&placement.dest)
+                .parent()
+                .is_some_and(|parent| directories.contains(parent))
+        }));
+    }
+
+    #[test]
+    fn filename_dates_are_limited_to_valid_years_and_calendar_days() {
+        let next_year = chrono::Utc::now().year() + 1;
+        assert_eq!(
+            date_from_filename("photo_1990-01-01.jpg"),
+            Some("1990-01-01".to_string())
+        );
+        assert_eq!(
+            date_from_filename("19900101"),
+            Some("1990-01-01".to_string())
+        );
+        assert_eq!(
+            date_from_filename(&format!("photo_{next_year}0101.jpg")),
+            Some(format!("{next_year}-01-01"))
+        );
+        assert_eq!(date_from_filename("photo_1989-12-31.jpg"), None);
+        assert_eq!(
+            date_from_filename(&format!("photo_{}0101.jpg", next_year + 1)),
+            None
+        );
+        assert_eq!(date_from_filename("photo_20230229.jpg"), None);
+    }
+
+    #[test]
+    fn filename_date_and_time_are_consumed_from_the_media_item() {
+        let mut item = sample_item("photo.jpg");
+        item.date = Some("2023-11-15".to_string());
+        item.time = Some("001320".to_string());
+        item.tz = Some("America/Los_Angeles".to_string());
+        let placements = plan(
+            &[item],
+            &PlannerSettings {
+                album_mode: AlbumMode::Off,
+                file_names: "dateTime".to_string(),
+                ..PlannerSettings::default()
+            },
+        );
+
+        assert!(placements.iter().any(|placement| destination_ends_with(
+            &placement.dest,
+            "2023/11/2023-11-15_001320_photo.jpg"
+        )));
+    }
+
+    #[test]
     fn custom_name_pattern_and_multiple_album_copy_are_applied() {
         let mut item = sample_item("photo.jpg");
         item.additional_albums = vec!["Family".to_string()];
@@ -1249,6 +1640,30 @@ mod tests {
     }
 
     #[test]
+    fn unknown_file_types_are_copied_to_other_without_json() {
+        let mut item = sample_item("notes.bin");
+        item.is_photo = false;
+        item.is_video = false;
+        item.has_json = false;
+        item.edited = true;
+        let settings = PlannerSettings {
+            album_mode: AlbumMode::Copy,
+            edited_versions: EditedVersions::Originals,
+            no_json: NoJsonMode::Leave,
+            ..PlannerSettings::default()
+        };
+
+        let placements = plan(&[item], &settings);
+
+        assert_eq!(placements.len(), 1);
+        assert!(destination_ends_with(
+            &placements[0].dest,
+            "Other/notes.bin"
+        ));
+        assert_eq!(placements[0].kind, PlacementKind::Original);
+    }
+
+    #[test]
     fn output_root_uses_library_child_for_chosen_folder() {
         let settings = PlannerSettings {
             output_root: Some("/Volumes/Archive".to_string()),
@@ -1267,6 +1682,15 @@ mod tests {
         assert_eq!(sanitize_file_part("CON.txt"), "_CON.txt");
         assert_eq!(sanitize_file_part("  final.jpg  "), "final.jpg");
         assert_eq!(sanitize_file_part("2024/01/01"), "2024_01_01");
+        assert_eq!(sanitize_file_part("ab\u{0001}cd.jpg"), "abcd.jpg");
+
+        let long_name = format!("{}.jpg", "é".repeat(130));
+        let sanitized = sanitize_file_part(&long_name);
+        assert!(sanitized.len() <= 255);
+        assert!(sanitized.ends_with(".jpg"));
+        let sanitized_stem = sanitized.strip_suffix(".jpg").expect("preserve extension");
+        assert!(sanitized_stem.len() <= 251);
+        assert!(sanitized_stem.chars().all(|character| character == 'é'));
     }
 
     #[test]
@@ -1308,6 +1732,8 @@ mod tests {
             album: Some("Paris trip".to_string()),
             additional_albums: Vec::new(),
             date: Some("2024-05-16".to_string()),
+            time: None,
+            tz: None,
             size_bytes: 0,
             is_photo: false,
             is_video: true,

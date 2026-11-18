@@ -60,6 +60,25 @@ export default function ProgressPage() {
     };
   }, [claimStart, navigate, setProgress, setReport, setStatus, settings]);
 
+  useEffect(() => {
+    let active = true;
+    const refreshStatus = () => {
+      callCommand('run_status', {}).then((status) => {
+        if (!active || !status.running) return;
+        setPaused(status.paused);
+        setStatus(status.paused ? 'Paused' : 'Running');
+      }).catch((reason: unknown) => {
+        if (active) setError(reason instanceof Error ? reason.message : String(reason));
+      });
+    };
+    refreshStatus();
+    const interval = window.setInterval(refreshStatus, 1000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [setStatus]);
+
   const togglePause = async () => {
     try {
       if (paused) await callCommand('resume_run', {});

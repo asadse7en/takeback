@@ -56,6 +56,7 @@ export type RunSummary = {
   skipped: number;
   failed: number;
   filesWithoutJson: number;
+  otherFiles: number;
   collisions: number;
   datesRestored: number;
   locationsAdded: number;
@@ -96,6 +97,14 @@ export type ProcessingStartResult = {
   report: ReportDocument | null;
 };
 
+export type RunStatus = {
+  running: boolean;
+  paused: boolean;
+  completed: number;
+  total: number;
+  summary: RunSummary | null;
+};
+
 export type ReportFormat = 'csv' | 'json';
 
 export type ReportExport = {
@@ -126,6 +135,7 @@ export type BackendCommandContracts = {
   remove_source: { args: { sourceId: string }; result: ScanSourcesResult };
   get_preview: { args: { settings: Settings }; result: PreviewResult };
   start_processing: { args: { settings: Settings }; result: ProcessingStartResult };
+  run_status: { args: Record<string, never>; result: RunStatus };
   cancel_processing: { args: Record<string, never>; result: boolean };
   load_settings: { args: Record<string, never>; result: Settings };
   save_settings: { args: { settings: Settings }; result: void };

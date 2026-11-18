@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { save } from '@tauri-apps/plugin-dialog';
-import { Disc3, FileText, Image, Trash2 } from 'lucide-react';
+import { Disc3, File, FileText, Image, Trash2 } from 'lucide-react';
 import { Button, PageFrame, Panel, PhotoThumb } from '@/components/Ui';
 import { callCommand, type ReportFormat } from '@/lib/api';
 import { useReportStore } from '@/store/report';
@@ -38,6 +38,7 @@ export default function ReportPage() {
   const summary = report?.summary;
   const stats = [
     { value: (summary?.processed ?? 0).toLocaleString(), label: 'Files fixed', icon: <Image /> },
+    { value: (summary?.otherFiles ?? 0).toLocaleString(), label: 'Other files', icon: <File /> },
     { value: (summary?.livePhotosMerged ?? 0).toLocaleString(), label: 'Live photos merged', icon: <Disc3 /> },
     { value: (summary?.filesWithoutJson ?? 0).toLocaleString(), label: 'No JSON found', icon: <FileText /> },
     { value: ((summary?.warnings.length ?? 0) + (summary?.problems.length ?? 0)).toLocaleString(), label: 'Warnings', icon: <Trash2 /> },
@@ -64,7 +65,7 @@ export default function ReportPage() {
     setError('');
     try {
       await navigator.clipboard.writeText(
-        `Takeback run completed in ${Math.round(report.elapsedSeconds)} seconds.\n${report.summary.processed} processed, ${report.summary.skipped} skipped, ${report.summary.failed} failed.\n${report.summary.filesWithoutJson} files without JSON, ${report.summary.collisions} collisions, ${report.summary.warnings.length} warnings.\nOutput: ${report.outputFolder}`,
+        `Takeback run completed in ${Math.round(report.elapsedSeconds)} seconds.\n${report.summary.processed} processed, ${report.summary.skipped} skipped, ${report.summary.failed} failed.\n${report.summary.otherFiles} other files, ${report.summary.filesWithoutJson} files without JSON, ${report.summary.collisions} collisions, ${report.summary.warnings.length} warnings.\nOutput: ${report.outputFolder}`,
       );
       setMessage('Summary copied to clipboard.');
     } catch (reason) {

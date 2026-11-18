@@ -995,6 +995,30 @@
   padding: 10px 18px;
 }
 
+.delete-confirm-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 14px 18px 18px;
+  color: var(--tb-color-ink);
+  font-size: 12px;
+}
+
+.delete-confirm-field input {
+  min-height: 34px;
+  border: 1px solid var(--tb-color-divider);
+  border-radius: var(--tb-radius-control);
+  background: var(--tb-color-surface);
+  padding: 6px 8px;
+  color: var(--tb-color-ink);
+  font: inherit;
+}
+
+.delete-confirm-field input:focus-visible {
+  outline: 2px solid var(--tb-color-accent-border);
+  outline-offset: 2px;
+}
+
 .progress-card {
   display: flex;
   min-height: 180px;
@@ -1319,7 +1343,7 @@
 
 .report-stats {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 12px;
 }
 
