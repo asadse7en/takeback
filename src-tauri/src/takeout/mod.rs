@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::archive::{
     AddSourcesResult, ArchiveType, EntryType, IndexedEntry, SourceEntry, SourceRecord,
@@ -35,21 +37,47 @@ pub struct ScanWarning {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ScanProgressUpdate {
+    pub archive_index: u32,
+    pub archive_count: u32,
+    pub current_archive: String,
+    pub entries_seen: u64,
+    pub bytes_read: u64,
+    pub total_bytes: u64,
+}
+
+pub const SCAN_CANCELLED_ERROR: &str = "Scan cancelled.";
+
 pub trait Source: Send + Sync {
     fn visit_entries(
         &self,
         visitor: &mut dyn FnMut(&SourceEntry, &mut dyn Read) -> Result<(), String>,
+        cancelled: Option<&AtomicBool>,
     ) -> Result<(), String>;
 
     fn copy_entry_to(&self, entry_path: &str, output: &mut dyn Write) -> Result<u64, String>;
 
+    fn read_video_duration_seconds(&self, entry_path: &str) -> Result<Option<f64>, String>;
+
     fn list_entries(&self) -> Result<Vec<SourceEntry>, String> {
         let mut entries = Vec::new();
-        self.visit_entries(&mut |entry, _| {
-            entries.push(entry.clone());
-            Ok(())
-        })?;
+        self.visit_entries(
+            &mut |entry, _| {
+                entries.push(entry.clone());
+                Ok(())
+            },
+            None,
+        )?;
         Ok(entries)
+    }
+}
+
+fn check_scan_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), String> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        Err(SCAN_CANCELLED_ERROR.to_string())
+    } else {
+        Ok(())
     }
 }
 
@@ -58,10 +86,22 @@ pub struct ZipSource {
     pub path: PathBuf,
 }
 
+impl ZipSource {
+    fn entry_count(&self) -> Result<u64, String> {
+        let file = fs::File::open(&self.path)
+            .map_err(|error| format!("open zip {}: {error}", self.path.display()))?;
+        let archive = ZipArchive::new(file)
+            .map_err(|error| format!("read zip {}: {error}", self.path.display()))?;
+        u64::try_from(archive.len())
+            .map_err(|_| format!("zip {} has too many entries", self.path.display()))
+    }
+}
+
 impl Source for ZipSource {
     fn visit_entries(
         &self,
         visitor: &mut dyn FnMut(&SourceEntry, &mut dyn Read) -> Result<(), String>,
+        cancelled: Option<&AtomicBool>,
     ) -> Result<(), String> {
         let file = fs::File::open(&self.path)
             .map_err(|e| format!("open zip {}: {e}", self.path.display()))?;
@@ -69,6 +109,7 @@ impl Source for ZipSource {
             ZipArchive::new(file).map_err(|e| format!("read zip {}: {e}", self.path.display()))?;
 
         for idx in 0..archive.len() {
+            check_scan_cancelled(cancelled)?;
             let mut entry = archive
                 .by_index(idx)
                 .map_err(|e| format!("read zip entry {}: {e}", self.path.display()))?;
@@ -98,6 +139,46 @@ impl Source for ZipSource {
             .map_err(|_| format!("zip entry not found: {entry_path}"))?;
         io::copy(&mut entry, output).map_err(|e| format!("stream zip entry {entry_path}: {e}"))
     }
+
+    fn read_video_duration_seconds(&self, entry_path: &str) -> Result<Option<f64>, String> {
+        let file = fs::File::open(&self.path)
+            .map_err(|error| format!("open zip {}: {error}", self.path.display()))?;
+        let mut archive = ZipArchive::new(file)
+            .map_err(|error| format!("read zip {}: {error}", self.path.display()))?;
+        let mut entry = archive
+            .by_name(entry_path)
+            .map_err(|error| format!("open video entry {entry_path}: {error}"))?;
+        let size = entry.size();
+        let data_start = entry.data_start();
+        let stored = entry.compression() == zip::CompressionMethod::Stored;
+        let mut head = Vec::new();
+        entry
+            .by_ref()
+            .take(crate::takeout::matcher::VIDEO_DURATION_PROBE_BYTES as u64)
+            .read_to_end(&mut head)
+            .map_err(|error| format!("read video header {entry_path}: {error}"))?;
+        drop(entry);
+        drop(archive);
+        if let Some(duration) = matcher::read_video_duration_seconds(&head[..])? {
+            return Ok(Some(duration));
+        }
+        if !stored || size <= matcher::VIDEO_DURATION_PROBE_BYTES as u64 {
+            return Ok(None);
+        }
+
+        let tail_len = size.min(matcher::VIDEO_DURATION_PROBE_BYTES as u64);
+        let tail_start = data_start
+            .checked_add(size - tail_len)
+            .ok_or_else(|| format!("video entry offset overflows: {entry_path}"))?;
+        let mut file = fs::File::open(&self.path)
+            .map_err(|error| format!("open zip {}: {error}", self.path.display()))?;
+        file.seek(SeekFrom::Start(tail_start))
+            .map_err(|error| format!("seek to video tail {entry_path}: {error}"))?;
+        let mut tail = vec![0; tail_len as usize];
+        file.read_exact(&mut tail)
+            .map_err(|error| format!("read video tail {entry_path}: {error}"))?;
+        matcher::read_video_duration_from_tail(&tail)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +190,7 @@ impl Source for TgzSource {
     fn visit_entries(
         &self,
         visitor: &mut dyn FnMut(&SourceEntry, &mut dyn Read) -> Result<(), String>,
+        cancelled: Option<&AtomicBool>,
     ) -> Result<(), String> {
         let file = fs::File::open(&self.path)
             .map_err(|e| format!("open tgz {}: {e}", self.path.display()))?;
@@ -119,6 +201,7 @@ impl Source for TgzSource {
             .entries()
             .map_err(|e| format!("read tgz {}: {e}", self.path.display()))?
         {
+            check_scan_cancelled(cancelled)?;
             let mut file =
                 entry.map_err(|e| format!("read tgz entry {}: {e}", self.path.display()))?;
             if !file.header().entry_type().is_file() {
@@ -161,6 +244,37 @@ impl Source for TgzSource {
         }
         Err(format!("tgz entry not found: {entry_path}"))
     }
+
+    fn read_video_duration_seconds(&self, entry_path: &str) -> Result<Option<f64>, String> {
+        let target_path = normalize_archive_entry_path(entry_path)?;
+        let file = fs::File::open(&self.path)
+            .map_err(|error| format!("open tgz {}: {error}", self.path.display()))?;
+        let decoder = GzDecoder::new(file);
+        let mut archive = Archive::new(decoder);
+        for item in archive
+            .entries()
+            .map_err(|error| format!("read tgz {}: {error}", self.path.display()))?
+        {
+            let mut entry =
+                item.map_err(|error| format!("read tgz entry {}: {error}", self.path.display()))?;
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            let path_bytes = entry.path_bytes();
+            let raw_path = std::str::from_utf8(path_bytes.as_ref())
+                .map_err(|error| format!("tgz entry path is not valid UTF-8: {error}"))?;
+            if normalize_archive_entry_path(raw_path)? != target_path {
+                continue;
+            }
+            let mut head = Vec::new();
+            (&mut entry)
+                .take(matcher::VIDEO_DURATION_PROBE_BYTES as u64)
+                .read_to_end(&mut head)
+                .map_err(|error| format!("read video header {entry_path}: {error}"))?;
+            return matcher::read_video_duration_seconds(&head[..]);
+        }
+        Err(format!("tgz entry not found: {entry_path}"))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -172,8 +286,10 @@ impl Source for FolderSource {
     fn visit_entries(
         &self,
         visitor: &mut dyn FnMut(&SourceEntry, &mut dyn Read) -> Result<(), String>,
+        cancelled: Option<&AtomicBool>,
     ) -> Result<(), String> {
         for entry in WalkDir::new(&self.root).into_iter() {
+            check_scan_cancelled(cancelled)?;
             let entry = entry.map_err(|e| format!("read folder {}: {e}", self.root.display()))?;
             let path = entry.path();
             if !entry.file_type().is_file() {
@@ -212,6 +328,18 @@ impl Source for FolderSource {
         let mut file =
             fs::File::open(&path).map_err(|e| format!("open file {}: {e}", path.display()))?;
         io::copy(&mut file, output).map_err(|e| format!("stream file {}: {e}", path.display()))
+    }
+
+    fn read_video_duration_seconds(&self, entry_path: &str) -> Result<Option<f64>, String> {
+        let normalized = normalize_archive_entry_path(entry_path)?;
+        let path = normalized
+            .split('/')
+            .fold(self.root.clone(), |current, part| current.join(part));
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("read video metadata {}: {error}", path.display()))?;
+        let mut file = fs::File::open(&path)
+            .map_err(|error| format!("open video {}: {error}", path.display()))?;
+        matcher::read_video_duration_from_seekable(&mut file, metadata.len())
     }
 }
 
@@ -257,48 +385,6 @@ impl TempIndex {
         })
     }
 
-    fn add_entry(
-        &self,
-        archive_path: &str,
-        entry: &SourceEntry,
-        album: Option<&str>,
-        trashed: bool,
-        archived: bool,
-        embedded_motion_video: bool,
-        video_duration_seconds: Option<f64>,
-        metadata: Option<&crate::metadata::TakeoutMetadata>,
-    ) -> Result<(), String> {
-        let size = i64::try_from(entry.size)
-            .map_err(|_| format!("entry is too large to index: {}", entry.path))?;
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO entries (
-                archive_path, path, entry_path, size, kind, album, trashed, archived,
-                embedded_motion_video, video_duration_seconds, metadata_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                (
-                    archive_path,
-                    &entry.path,
-                    &entry.entry_path,
-                    size,
-                    entry_type_name(entry.entry_type),
-                    album,
-                    trashed,
-                    archived,
-                    embedded_motion_video,
-                    video_duration_seconds,
-                    metadata
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .map_err(|error| {
-                            format!("serialize JSON sidecar {}: {error}", entry.path)
-                        })?,
-                ),
-            )
-            .map_err(|e| format!("index entry {}: {e}", entry.path))?;
-        Ok(())
-    }
-
     fn set_sidecar(
         &self,
         archive_path: &str,
@@ -321,6 +407,82 @@ impl TempIndex {
                 ),
             )
             .map_err(|e| format!("pair JSON sidecar with {}: {e}", path))?;
+        Ok(())
+    }
+
+    pub fn remove_archive(&self, archive_path: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM entries WHERE archive_path = ?1",
+                [archive_path],
+            )
+            .map_err(|error| format!("remove archive from index {archive_path}: {error}"))?;
+        Ok(())
+    }
+
+    pub fn rematch_sidecars(&self) -> Result<(), String> {
+        let entries = self.entries()?;
+        let media_entries = entries
+            .iter()
+            .filter(|entry| matches!(entry.entry_type, EntryType::Photo | EntryType::Video))
+            .collect::<Vec<_>>();
+        let media_paths = media_entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT archive_path, path, metadata_json
+                 FROM entries WHERE kind = 'jsonSidecar'",
+            )
+            .map_err(|error| format!("prepare sidecar lookup: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|error| format!("query indexed sidecars: {error}"))?;
+        let mut sidecars = Vec::new();
+        for row in rows {
+            let (archive_path, path, metadata_json) =
+                row.map_err(|error| format!("read indexed sidecar: {error}"))?;
+            let metadata: Option<crate::metadata::TakeoutMetadata> = metadata_json
+                .map(|json| {
+                    serde_json::from_str(&json)
+                        .map_err(|error| format!("read indexed sidecar metadata: {error}"))
+                })
+                .transpose()?;
+            sidecars.push(matcher::SidecarCandidate {
+                archive_path,
+                path,
+                title: metadata.and_then(|metadata| metadata.title),
+            });
+        }
+
+        self.conn
+            .execute(
+                "UPDATE entries
+                 SET sidecar_archive_path = NULL, sidecar_path = NULL, sidecar_match = NULL",
+                (),
+            )
+            .map_err(|error| format!("clear sidecar matches: {error}"))?;
+
+        let matches = matcher::match_sidecars(&media_paths, &sidecars);
+        for (entry, matched) in media_entries.iter().zip(matches) {
+            if let Some(matched) = matched {
+                self.set_sidecar(
+                    &entry.archive_path,
+                    &entry.path,
+                    &matched.archive_path,
+                    &matched.path,
+                    &format!("{:?}", matched.reason),
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -484,6 +646,100 @@ impl TempIndex {
     }
 }
 
+struct IndexInsertBatch<'a> {
+    connection: &'a rusqlite::Connection,
+    transaction: Option<rusqlite::Transaction<'a>>,
+    rows_since_commit: usize,
+}
+
+impl<'a> IndexInsertBatch<'a> {
+    fn new(connection: &'a rusqlite::Connection) -> Result<Self, String> {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| format!("begin archive index transaction: {error}"))?;
+        Ok(Self {
+            connection,
+            transaction: Some(transaction),
+            rows_since_commit: 0,
+        })
+    }
+
+    fn insert(
+        &mut self,
+        archive_path: &str,
+        entry: &SourceEntry,
+        album: Option<&str>,
+        trashed: bool,
+        archived: bool,
+        embedded_motion_video: bool,
+        metadata: Option<&crate::metadata::TakeoutMetadata>,
+    ) -> Result<(), String> {
+        let size = i64::try_from(entry.size)
+            .map_err(|_| format!("entry is too large to index: {}", entry.path))?;
+        let transaction = self
+            .transaction
+            .as_ref()
+            .ok_or_else(|| "archive index transaction is unavailable".to_string())?;
+        let mut statement = transaction
+            .prepare_cached(
+                "INSERT OR REPLACE INTO entries (
+                    archive_path, path, entry_path, size, kind, album, trashed, archived,
+                    embedded_motion_video, video_duration_seconds, metadata_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
+            )
+            .map_err(|error| format!("prepare archive index insert: {error}"))?;
+        statement
+            .execute((
+                archive_path,
+                &entry.path,
+                &entry.entry_path,
+                size,
+                entry_type_name(entry.entry_type),
+                album,
+                trashed,
+                archived,
+                embedded_motion_video,
+                metadata
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|error| format!("serialize JSON sidecar {}: {error}", entry.path))?,
+            ))
+            .map_err(|error| format!("index entry {}: {error}", entry.path))?;
+        drop(statement);
+        self.rows_since_commit += 1;
+        if self.rows_since_commit == 5_000 {
+            self.commit_and_continue()?;
+        }
+        Ok(())
+    }
+
+    fn commit_and_continue(&mut self) -> Result<(), String> {
+        let transaction = self
+            .transaction
+            .take()
+            .ok_or_else(|| "archive index transaction is unavailable".to_string())?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit archive index batch: {error}"))?;
+        self.rows_since_commit = 0;
+        self.transaction = Some(
+            self.connection
+                .unchecked_transaction()
+                .map_err(|error| format!("begin archive index transaction: {error}"))?,
+        );
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        if let Some(transaction) = self.transaction.take() {
+            transaction
+                .commit()
+                .map_err(|error| format!("commit archive index batch: {error}"))?;
+        }
+        Ok(())
+    }
+}
+
 pub fn index_sources(paths: &[String]) -> Result<TempIndex, String> {
     let expanded_paths = expand_source_paths(paths)?;
     index_expanded_sources(&expanded_paths)
@@ -494,74 +750,158 @@ pub fn index_explicit_sources(paths: &[String]) -> Result<TempIndex, String> {
 }
 
 fn index_expanded_sources(paths: &[String]) -> Result<TempIndex, String> {
-    let index = TempIndex::new()?;
-    let mut media_refs = Vec::new();
-    let mut media_paths = Vec::new();
-    let mut sidecars = Vec::new();
+    let mut on_progress = |_| Ok(());
+    index_expanded_sources_with_progress(paths, None, 0, &mut on_progress).map(|(index, _)| index)
+}
 
-    for path in paths.iter().filter(|path| !path.trim().is_empty()) {
-        let source_path = Path::new(path);
-        let source = create_source(source_path)?;
-        let archive_path = source_path.to_string_lossy().to_string();
-        source.visit_entries(&mut |entry, reader| {
+fn index_expanded_sources_with_progress(
+    paths: &[String],
+    cancelled: Option<&AtomicBool>,
+    total_bytes: u64,
+    on_progress: &mut dyn FnMut(ScanProgressUpdate) -> Result<(), String>,
+) -> Result<(TempIndex, ScanProgressUpdate), String> {
+    let index = TempIndex::new()?;
+    let archive_count = u32::try_from(paths.len()).unwrap_or(u32::MAX);
+    let mut progress = ScanProgressUpdate::default();
+    let mut last_progress = Instant::now();
+
+    for (archive_offset, path) in paths.iter().enumerate() {
+        index_archive_into(
+            &index,
+            path,
+            u32::try_from(archive_offset + 1).unwrap_or(u32::MAX),
+            archive_count,
+            total_bytes,
+            &mut progress,
+            &mut last_progress,
+            cancelled,
+            on_progress,
+        )?;
+    }
+
+    index.rematch_sidecars()?;
+    Ok((index, progress))
+}
+
+pub fn index_archive_into(
+    index: &TempIndex,
+    path: &str,
+    archive_index: u32,
+    archive_count: u32,
+    total_bytes: u64,
+    progress: &mut ScanProgressUpdate,
+    last_progress: &mut Instant,
+    cancelled: Option<&AtomicBool>,
+    on_progress: &mut dyn FnMut(ScanProgressUpdate) -> Result<(), String>,
+) -> Result<(), String> {
+    check_scan_cancelled(cancelled)?;
+    let source_path = Path::new(path);
+    let source = create_source(source_path)?;
+    let archive_path = source_path.to_string_lossy().to_string();
+    progress.archive_index = archive_index;
+    progress.archive_count = archive_count;
+    progress.current_archive.clone_from(&archive_path);
+    progress.total_bytes = total_bytes;
+    emit_scan_progress(on_progress, last_progress, progress)?;
+    let mut insert_batch = IndexInsertBatch::new(&index.conn)?;
+
+    let visit_result = source.visit_entries(
+        &mut |entry, reader| {
+            check_scan_cancelled(cancelled)?;
+            let mut reader = CountingReader::new(reader, cancelled);
             let metadata = if entry.entry_type == EntryType::JsonSidecar {
-                Some(crate::metadata::TakeoutMetadata::from_reader(&mut *reader)?)
+                Some(crate::metadata::TakeoutMetadata::from_reader(&mut reader)?)
             } else {
                 None
             };
             let embedded_motion_video = if matcher::is_android_motion_photo_path(&entry.path) {
-                matcher::verify_android_motion_photo(&mut *reader)?
+                matcher::has_motion_photo_xmp_markers(&mut reader)?
             } else {
                 false
             };
-            let video_duration_seconds = if entry.entry_type == EntryType::Video {
-                matcher::read_video_duration_seconds(&mut *reader)?
-            } else {
-                None
-            };
+            let entry_bytes_read = reader.bytes_read();
             let (album, trashed, archived) = classify_entry_path(&entry.path);
-            index.add_entry(
+            insert_batch.insert(
                 &archive_path,
                 entry,
                 album.as_deref(),
                 trashed,
                 archived,
                 embedded_motion_video,
-                video_duration_seconds,
                 metadata.as_ref(),
             )?;
-            match entry.entry_type {
-                EntryType::Photo | EntryType::Video => {
-                    media_refs.push((archive_path.clone(), entry.path.clone()));
-                    media_paths.push(entry.path.clone());
-                }
-                EntryType::JsonSidecar => {
-                    sidecars.push(matcher::SidecarCandidate {
-                        archive_path: archive_path.clone(),
-                        path: entry.path.clone(),
-                        title: metadata.and_then(|fields| fields.title),
-                    });
-                }
-                EntryType::Other => {}
-            }
+            progress.entries_seen = progress.entries_seen.saturating_add(1);
+            progress.bytes_read = progress.bytes_read.saturating_add(entry_bytes_read);
+            emit_scan_progress(on_progress, last_progress, progress)?;
             Ok(())
-        })?;
+        },
+        cancelled,
+    );
+    if let Err(error) = visit_result {
+        drop(insert_batch);
+        return match index.remove_archive(&archive_path) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(format!(
+                "{error}; could not remove partial archive index: {cleanup_error}"
+            )),
+        };
     }
 
-    let matches = matcher::match_sidecars(&media_paths, &sidecars);
-    for ((archive_path, media_path), matched) in media_refs.iter().zip(matches) {
-        if let Some(matched) = matched {
-            index.set_sidecar(
-                archive_path,
-                media_path,
-                &matched.archive_path,
-                &matched.path,
-                &format!("{:?}", matched.reason),
-            )?;
+    match insert_batch.finish() {
+        Ok(()) => Ok(()),
+        Err(error) => match index.remove_archive(&archive_path) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(format!(
+                "{error}; could not remove partial archive index: {cleanup_error}"
+            )),
+        },
+    }
+}
+
+fn emit_scan_progress(
+    on_progress: &mut dyn FnMut(ScanProgressUpdate) -> Result<(), String>,
+    last_progress: &mut Instant,
+    progress: &ScanProgressUpdate,
+) -> Result<(), String> {
+    if last_progress.elapsed() >= Duration::from_millis(250) {
+        on_progress(progress.clone())?;
+        *last_progress = Instant::now();
+    }
+    Ok(())
+}
+
+struct CountingReader<'a> {
+    inner: &'a mut dyn Read,
+    bytes_read: u64,
+    cancelled: Option<&'a AtomicBool>,
+}
+
+impl<'a> CountingReader<'a> {
+    fn new(inner: &'a mut dyn Read, cancelled: Option<&'a AtomicBool>) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+            cancelled,
         }
     }
 
-    Ok(index)
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+}
+
+impl Read for CountingReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self
+            .cancelled
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+        {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
+        }
+        let count = self.inner.read(buffer)?;
+        self.bytes_read = self.bytes_read.saturating_add(count as u64);
+        Ok(count)
+    }
 }
 
 fn classify_entry_path(path: &str) -> (Option<String>, bool, bool) {
@@ -703,7 +1043,7 @@ fn push_source_path(
     }
 }
 
-fn expand_source_paths(paths: &[String]) -> Result<Vec<String>, String> {
+pub fn expand_source_paths(paths: &[String]) -> Result<Vec<String>, String> {
     let mut expanded = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -764,24 +1104,26 @@ pub fn inspect_sources(paths: &[String]) -> Result<AddSourcesResult, String> {
     for source_path in expand_source_paths(paths)? {
         let path = Path::new(&source_path);
         let archive_type = archive_type_for_path(path)?;
-        let source = create_source(path)?;
-        let mut entry_count = 0u64;
-        let mut folder_size = 0u64;
-        source.visit_entries(&mut |entry, _| {
-            entry_count += 1;
-            if archive_type == ArchiveType::Folder {
-                folder_size = folder_size
-                    .checked_add(entry.size)
-                    .ok_or_else(|| "folder size is too large to calculate".to_string())?;
+        let (entry_count, entry_count_known, folder_size) = match archive_type {
+            ArchiveType::Zip => (
+                ZipSource {
+                    path: path.to_path_buf(),
+                }
+                .entry_count()?,
+                true,
+                0,
+            ),
+            ArchiveType::Tgz => (0, false, 0),
+            ArchiveType::Folder => {
+                let (entry_count, folder_size) = folder_entry_stats(path)?;
+                (entry_count, true, folder_size)
             }
-            Ok(())
-        })?;
-        let size_bytes = if archive_type == ArchiveType::Folder {
-            folder_size
-        } else {
-            fs::metadata(path)
+        };
+        let size_bytes = match archive_type {
+            ArchiveType::Folder => folder_size,
+            ArchiveType::Zip | ArchiveType::Tgz => fs::metadata(path)
                 .map_err(|error| format!("read source metadata {}: {error}", path.display()))?
-                .len()
+                .len(),
         };
         result.archives.push(SourceRecord {
             id: path.to_string_lossy().to_string(),
@@ -789,6 +1131,7 @@ pub fn inspect_sources(paths: &[String]) -> Result<AddSourcesResult, String> {
             archive_type,
             size_bytes,
             entry_count,
+            entry_count_known,
         });
         part_names.push(source_path);
     }
@@ -799,6 +1142,27 @@ pub fn inspect_sources(paths: &[String]) -> Result<AddSourcesResult, String> {
             .push(format!("Missing Takeout archive part {missing:03}."));
     }
     Ok(result)
+}
+
+fn folder_entry_stats(root: &Path) -> Result<(u64, u64), String> {
+    let mut entry_count = 0u64;
+    let mut folder_size = 0u64;
+    for entry in WalkDir::new(root) {
+        let entry = entry.map_err(|error| format!("read folder {}: {error}", root.display()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("read file metadata {}: {error}", entry.path().display()))?;
+        entry_count = entry_count
+            .checked_add(1)
+            .ok_or_else(|| "folder has too many files to count".to_string())?;
+        folder_size = folder_size
+            .checked_add(metadata.len())
+            .ok_or_else(|| "folder size is too large to calculate".to_string())?;
+    }
+    Ok((entry_count, folder_size))
 }
 
 pub fn detect_numbering_gaps(numbers: &[u32]) -> Vec<u32> {
@@ -854,24 +1218,46 @@ pub fn scan_paths(paths: &[String]) -> Result<ScanSourcesResult, String> {
 }
 
 pub fn scan_paths_with_index(paths: &[String]) -> Result<(ScanSourcesResult, TempIndex), String> {
+    scan_paths_with_progress(paths, None, &mut |_| Ok(())).map(|(result, index, _)| (result, index))
+}
+
+pub fn scan_paths_with_progress(
+    paths: &[String],
+    cancelled: Option<&AtomicBool>,
+    on_progress: &mut dyn FnMut(ScanProgressUpdate) -> Result<(), String>,
+) -> Result<(ScanSourcesResult, TempIndex, ScanProgressUpdate), String> {
+    check_scan_cancelled(cancelled)?;
     let expanded_paths = expand_source_paths(paths)?;
-    let index = index_expanded_sources(&expanded_paths)?;
+    let inspected_sources = inspect_sources(paths)?;
+    let total_bytes = inspected_sources
+        .archives
+        .iter()
+        .map(|source| source.size_bytes)
+        .fold(0u64, u64::saturating_add);
+    let (index, progress) =
+        index_expanded_sources_with_progress(&expanded_paths, cancelled, total_bytes, on_progress)?;
+    check_scan_cancelled(cancelled)?;
+    let result = scan_result_from_index(&expanded_paths, &index)?;
+    Ok((result, index, progress))
+}
+
+pub fn scan_result_from_index(
+    paths: &[String],
+    index: &TempIndex,
+) -> Result<ScanSourcesResult, String> {
     let counts = index.counts()?;
-    let mut warnings: Vec<String> = detect_numbering_gap_from_names(&expanded_paths)
+    let mut warnings: Vec<String> = detect_numbering_gap_from_names(paths)
         .into_iter()
         .map(|part| format!("Missing Takeout archive part {part:03}."))
         .collect();
     if let Some(root) = index.google_photos_root()? {
         warnings.push(format!("Detected Google Photos folder: {root}"));
     }
-    Ok((
-        ScanSourcesResult {
-            files: expanded_paths,
-            counts,
-            warnings,
-        },
-        index,
-    ))
+    Ok(ScanSourcesResult {
+        files: paths.to_vec(),
+        counts,
+        warnings,
+    })
 }
 
 pub fn create_source(path: &Path) -> Result<Box<dyn Source>, String> {
@@ -894,6 +1280,13 @@ pub fn create_source(path: &Path) -> Result<Box<dyn Source>, String> {
             root: path.to_path_buf(),
         })),
     }
+}
+
+pub fn read_video_duration_seconds(
+    archive_path: &str,
+    entry_path: &str,
+) -> Result<Option<f64>, String> {
+    create_source(Path::new(archive_path))?.read_video_duration_seconds(entry_path)
 }
 
 pub mod matcher;
@@ -1029,6 +1422,44 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_source_visit_stops_before_processing_entries() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("photo.jpg"), b"image").unwrap();
+        let source = FolderSource {
+            root: dir.path().to_path_buf(),
+        };
+        let cancelled = AtomicBool::new(true);
+        let mut visited = 0;
+
+        let result = source.visit_entries(
+            &mut |_, _| {
+                visited += 1;
+                Ok(())
+            },
+            Some(&cancelled),
+        );
+
+        assert_eq!(result, Err(SCAN_CANCELLED_ERROR.to_string()));
+        assert_eq!(visited, 0);
+    }
+
+    #[test]
+    fn scan_progress_is_throttled() {
+        let mut last_progress = Instant::now() - Duration::from_secs(1);
+        let mut emitted = 0;
+        let mut callback = |_| {
+            emitted += 1;
+            Ok(())
+        };
+        let progress = ScanProgressUpdate::default();
+
+        emit_scan_progress(&mut callback, &mut last_progress, &progress).unwrap();
+        emit_scan_progress(&mut callback, &mut last_progress, &progress).unwrap();
+
+        assert_eq!(emitted, 1);
+    }
+
+    #[test]
     fn numbering_gaps_and_google_photos_root_detected() {
         let files = vec![
             "takeout-20240612T101500Z-001.zip".to_string(),
@@ -1062,8 +1493,38 @@ mod tests {
             fs::metadata(&first).unwrap().len()
         );
         assert_eq!(result.archives[0].entry_count, 2);
+        assert!(result.archives[0].entry_count_known);
         assert_eq!(result.archives[1].entry_count, 1);
+        assert!(result.archives[1].entry_count_known);
         assert_eq!(result.warnings, vec!["Missing Takeout archive part 003."]);
+    }
+
+    #[test]
+    fn zip_inspection_counts_without_opening_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("takeout.zip");
+        create_zip(&path, &[("../unsafe.jpg", b"photo")]);
+
+        let result = inspect_sources(&[path.to_string_lossy().to_string()]).unwrap();
+
+        assert_eq!(result.archives[0].entry_count, 1);
+        assert!(result.archives[0].entry_count_known);
+    }
+
+    #[test]
+    fn folder_inspection_counts_files_and_sums_file_sizes() {
+        let dir = tempdir().unwrap();
+        let folder = dir.path().join("takeout");
+        fs::create_dir_all(folder.join("nested")).unwrap();
+        fs::write(folder.join("photo.jpg"), b"photo").unwrap();
+        fs::write(folder.join("nested").join("video.mp4"), b"video-data").unwrap();
+
+        let result = inspect_sources(&[folder.to_string_lossy().to_string()]).unwrap();
+
+        assert_eq!(result.archives[0].archive_type, ArchiveType::Folder);
+        assert_eq!(result.archives[0].entry_count, 2);
+        assert!(result.archives[0].entry_count_known);
+        assert_eq!(result.archives[0].size_bytes, 15);
     }
 
     #[test]
@@ -1244,7 +1705,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_index_persists_motion_photo_verification_and_video_duration() {
+    fn archive_index_probes_motion_photo_markers_and_defers_video_duration() {
         fn atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
@@ -1281,7 +1742,147 @@ mod tests {
             .iter()
             .find(|entry| entry.path.ends_with("IMG_2.mov"))
             .unwrap();
-        assert_eq!(video.video_duration_seconds, Some(2.5));
+        assert_eq!(video.video_duration_seconds, None);
+        assert_eq!(
+            read_video_duration_seconds(&archive_path.to_string_lossy(), &video.entry_path)
+                .unwrap(),
+            Some(2.5)
+        );
+    }
+
+    #[test]
+    fn indexing_reads_json_and_only_the_motion_photo_prefix() {
+        let directory = tempdir().unwrap();
+        let archive_path = directory.path().join("bounded-index.zip");
+        let motion_photo = {
+            let mut bytes = vec![b'x'; 300 * 1024];
+            let marker = b"GCamera:MicroVideo XMP marker!";
+            bytes[..marker.len()].copy_from_slice(marker);
+            bytes
+        };
+        create_zip(
+            &archive_path,
+            &[
+                ("Photos/ordinary.jpg", &vec![b'p'; 300 * 1024]),
+                ("Photos/ordinary.mov", &vec![b'v'; 300 * 1024]),
+                ("Photos/IMG_1.MP.jpg", &motion_photo),
+                ("metadata.json", b"{}"),
+            ],
+        );
+
+        let mut progress = ScanProgressUpdate::default();
+        let mut last_progress = Instant::now();
+        let mut on_progress = |_| Ok(());
+        let index = TempIndex::new().unwrap();
+        index_archive_into(
+            &index,
+            &archive_path.to_string_lossy(),
+            1,
+            1,
+            0,
+            &mut progress,
+            &mut last_progress,
+            None,
+            &mut on_progress,
+        )
+        .unwrap();
+
+        assert_eq!(progress.bytes_read, (256 * 1024) + 2);
+        assert!(index
+            .media_entries()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.embedded_motion_video));
+    }
+
+    #[test]
+    fn duration_probes_tail_only_for_stored_zip_entries() {
+        fn atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
+            bytes.extend_from_slice(kind);
+            bytes.extend_from_slice(payload);
+            bytes
+        }
+
+        let directory = tempdir().unwrap();
+        let mut movie_header = vec![0, 0, 0, 0];
+        movie_header.extend_from_slice(&0_u32.to_be_bytes());
+        movie_header.extend_from_slice(&0_u32.to_be_bytes());
+        movie_header.extend_from_slice(&1_000_u32.to_be_bytes());
+        movie_header.extend_from_slice(&2_500_u32.to_be_bytes());
+        let moov = atom(b"moov", &atom(b"mvhd", &movie_header));
+        let mut video = vec![b'x'; matcher::VIDEO_DURATION_PROBE_BYTES + 128];
+        video.extend_from_slice(&moov);
+
+        let stored_path = directory.path().join("stored.zip");
+        create_zip(&stored_path, &[("Photos/IMG_1.mov", &video)]);
+        let deflated_path = directory.path().join("deflated.zip");
+        let file = fs::File::create(&deflated_path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        archive
+            .start_file(
+                "Photos/IMG_1.mov",
+                zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        archive.write_all(&video).unwrap();
+        archive.finish().unwrap();
+        let tgz_path = directory.path().join("video.tgz");
+        create_tgz(&tgz_path, &[("Photos/IMG_1.mov", &video)]);
+
+        assert_eq!(
+            ZipSource { path: stored_path }
+                .read_video_duration_seconds("Photos/IMG_1.mov")
+                .unwrap(),
+            Some(2.5)
+        );
+        assert_eq!(
+            ZipSource {
+                path: deflated_path
+            }
+            .read_video_duration_seconds("Photos/IMG_1.mov")
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            TgzSource { path: tgz_path }
+                .read_video_duration_seconds("Photos/IMG_1.mov")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn archive_index_inserts_commit_every_five_thousand_rows() {
+        let index = TempIndex::new().unwrap();
+        let db_path = index._temp_dir.path().join("takeback-index.sqlite");
+        let observer = Connection::open(db_path).unwrap();
+        let mut batch = IndexInsertBatch::new(&index.conn).unwrap();
+
+        for number in 0..5_001 {
+            let path = format!("Photos/{number}.jpg");
+            let entry = SourceEntry {
+                entry_path: path.clone(),
+                path,
+                size: 0,
+                entry_type: EntryType::Photo,
+            };
+            batch
+                .insert("archive.zip", &entry, None, false, false, false, None)
+                .unwrap();
+        }
+
+        let committed_rows: u32 = observer
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(committed_rows, 5_000);
+        batch.finish().unwrap();
+        let final_rows: u32 = observer
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(final_rows, 5_001);
     }
 
     #[test]
@@ -1315,7 +1916,12 @@ mod tests {
 
         assert_eq!(summary.archives.len(), 1);
         assert_eq!(summary.archives[0].archive_type, ArchiveType::Tgz);
-        assert_eq!(summary.archives[0].entry_count, 2);
+        assert_eq!(summary.archives[0].entry_count, 0);
+        assert!(!summary.archives[0].entry_count_known);
+        assert_eq!(
+            summary.archives[0].size_bytes,
+            fs::metadata(&path).unwrap().len()
+        );
         assert!(entries.iter().any(|entry| {
             entry.path.ends_with("photo.jpg")
                 && entry.sidecar_path.as_deref() == Some("Takeout/Google Fotos/photo.jpg.json")

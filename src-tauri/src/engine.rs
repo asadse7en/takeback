@@ -26,15 +26,6 @@ pub fn status() -> &'static str {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct RunProgressEvent {
-    pub file: String,
-    pub completed: u32,
-    pub total: u32,
-    pub status: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct RunSummary {
     pub planned: u32,
     pub processed: u32,
@@ -59,6 +50,7 @@ pub struct InputLocator {
     pub source: Arc<dyn Source>,
     pub archive_path: String,
     pub entry_path: String,
+    pub video_duration_seconds: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -721,6 +713,7 @@ fn process_worker(
                     &mut exiftool,
                     &mut processed_outputs,
                     &input_locators,
+                    task.item.embedded_motion_video,
                 )
             };
             sender
@@ -820,6 +813,7 @@ fn write_placement(
         exiftool,
         processed_outputs,
         &HashMap::new(),
+        false,
     )
 }
 
@@ -830,6 +824,7 @@ fn write_placement_with_sources(
     exiftool: &mut Option<ExifTool>,
     processed_outputs: &mut HashMap<String, PathBuf>,
     input_locators: &HashMap<String, InputLocator>,
+    embedded_motion_marker: bool,
 ) -> Result<PlacementResult, String> {
     let src = Path::new(&placement.src);
     let dest = Path::new(&placement.dest);
@@ -908,6 +903,18 @@ fn write_placement_with_sources(
         copy_source_into_temp(&placement.src, tmp_path, input_locators)?;
     }
 
+    if embedded_motion_marker {
+        let mut file = fs::File::open(tmp_path).map_err(|error| {
+            format!("open possible Motion Photo {}: {error}", tmp_path.display())
+        })?;
+        if !crate::takeout::matcher::verify_android_motion_photo(&mut file)? {
+            result.warnings.push(format!(
+                "Motion Photo markers were found in {}, but no embedded MP4 was verified.",
+                placement.src
+            ));
+        }
+    }
+
     if metadata_output && linked_output.is_none() {
         if supports_embedded_metadata(dest) {
             let writer = exiftool.as_mut().ok_or_else(|| {
@@ -979,7 +986,36 @@ fn write_placement_with_sources(
             .ok_or_else(|| "bundled ExifTool is not available for live photo writes".to_string())?;
         let video_temp = if input_locators.contains_key(video_source) {
             let temp = temp_path_for(dest)?;
-            copy_source_into_temp(video_source, temp.as_ref(), input_locators)?;
+            let video_temp_path: &Path = temp.as_ref();
+            copy_source_into_temp(video_source, video_temp_path, input_locators)?;
+            let duration_is_unknown = input_locators
+                .get(video_source)
+                .is_some_and(|locator| locator.video_duration_seconds.is_none());
+            if duration_is_unknown {
+                let metadata = fs::metadata(video_temp_path).map_err(|error| {
+                    format!(
+                        "read extracted video metadata {}: {error}",
+                        video_temp_path.display()
+                    )
+                })?;
+                let mut file = fs::File::open(video_temp_path).map_err(|error| {
+                    format!(
+                        "open extracted video {}: {error}",
+                        video_temp_path.display()
+                    )
+                })?;
+                if crate::takeout::matcher::read_video_duration_from_seekable(
+                    &mut file,
+                    metadata.len(),
+                )?
+                .is_none()
+                {
+                    result.warnings.push(format!(
+                        "Could not determine the duration of {}; the live pair was kept by matching name and folder.",
+                        video_source
+                    ));
+                }
+            }
             Some(temp)
         } else {
             None

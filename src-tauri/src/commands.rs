@@ -10,16 +10,143 @@ use chrono::TimeZone;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::{Manager, State};
+use std::time::Instant;
+use tauri::{ipc::Channel, Manager, State};
 
 #[derive(Clone, Default)]
 pub struct PreviewIndexState(Arc<Mutex<PreviewIndexData>>);
+
+#[derive(Clone, Default)]
+pub struct ScanControlState(Arc<Mutex<Option<ActiveScan>>>);
+
+struct ActiveScan {
+    id: String,
+    cancelled: Arc<AtomicBool>,
+}
+
+static NEXT_SCAN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
 struct PreviewIndexData {
     index: Option<crate::takeout::TempIndex>,
     source_paths: Vec<String>,
+    indexed_archives: HashMap<String, bool>,
+}
+
+fn archive_index_key(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
+}
+
+fn scan_into_preview_state(
+    state: &mut PreviewIndexData,
+    paths: &[String],
+    cancelled: Option<&AtomicBool>,
+    on_progress: &mut dyn FnMut(
+        crate::takeout::ScanProgressUpdate,
+    ) -> std::result::Result<(), String>,
+) -> std::result::Result<
+    (
+        crate::takeout::ScanSourcesResult,
+        crate::takeout::ScanProgressUpdate,
+    ),
+    String,
+> {
+    let expanded_paths = crate::takeout::expand_source_paths(paths)?;
+    for path in &expanded_paths {
+        let key = archive_index_key(path);
+        if !state
+            .source_paths
+            .iter()
+            .any(|existing| archive_index_key(existing) == key)
+        {
+            state.source_paths.push(path.clone());
+        }
+    }
+    let all_paths = state.source_paths.clone();
+    let new_paths = expanded_paths
+        .into_iter()
+        .filter(|path| state.indexed_archives.get(&archive_index_key(path)) != Some(&true))
+        .collect::<Vec<_>>();
+    for path in &new_paths {
+        state
+            .indexed_archives
+            .entry(archive_index_key(path))
+            .or_insert(false);
+    }
+
+    let total_bytes = crate::takeout::inspect_sources(&new_paths)?
+        .archives
+        .iter()
+        .map(|source| source.size_bytes)
+        .fold(0u64, u64::saturating_add);
+    let archive_count = u32::try_from(new_paths.len()).unwrap_or(u32::MAX);
+    let mut progress = crate::takeout::ScanProgressUpdate {
+        archive_count,
+        total_bytes,
+        ..crate::takeout::ScanProgressUpdate::default()
+    };
+    let mut last_progress = Instant::now();
+
+    let PreviewIndexData {
+        index: index_slot,
+        indexed_archives,
+        ..
+    } = state;
+    if index_slot.is_none() {
+        *index_slot = Some(crate::takeout::TempIndex::new()?);
+    }
+    let index = index_slot
+        .as_ref()
+        .ok_or_else(|| "Source index is unavailable.".to_string())?;
+    for (offset, path) in new_paths.iter().enumerate() {
+        index.remove_archive(path)?;
+        crate::takeout::index_archive_into(
+            index,
+            path,
+            u32::try_from(offset + 1).unwrap_or(u32::MAX),
+            archive_count,
+            total_bytes,
+            &mut progress,
+            &mut last_progress,
+            cancelled,
+            on_progress,
+        )?;
+        indexed_archives.insert(archive_index_key(path), true);
+    }
+    index.rematch_sidecars()?;
+    let result = crate::takeout::scan_result_from_index(&all_paths, index)?;
+    Ok((result, progress))
+}
+
+fn remove_source_from_preview_state(
+    state: &mut PreviewIndexData,
+    source_id: &str,
+) -> std::result::Result<crate::takeout::ScanSourcesResult, String> {
+    let key = archive_index_key(source_id);
+    let indexed_path = state
+        .source_paths
+        .iter()
+        .find(|path| archive_index_key(path) == key)
+        .cloned()
+        .unwrap_or_else(|| source_id.to_string());
+    if let Some(index) = state.index.as_ref() {
+        index.remove_archive(&indexed_path)?;
+    }
+    state
+        .source_paths
+        .retain(|path| archive_index_key(path) != key);
+    state.indexed_archives.remove(&key);
+    if let Some(index) = state.index.as_ref() {
+        index.rematch_sidecars()?;
+        crate::takeout::scan_result_from_index(&state.source_paths, index)
+    } else {
+        Ok(crate::takeout::ScanSourcesResult {
+            files: state.source_paths.clone(),
+            ..Default::default()
+        })
+    }
 }
 
 #[tauri::command]
@@ -34,88 +161,83 @@ pub async fn add_sources(paths: Vec<String>) -> Result<AddSourcesResult> {
 pub async fn remove_source(
     source_id: String,
     preview_state: State<'_, PreviewIndexState>,
-) -> Result<bool> {
+) -> Result<crate::takeout::ScanSourcesResult> {
     let data = preview_state.0.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let paths = {
-            let mut state = data.lock().map_err(|error| {
-                AppError::Other(format!("Source index is unavailable: {error}"))
-            })?;
-            state.source_paths.retain(|path| path != &source_id);
-            state.source_paths.clone()
-        };
-        let rebuilt = if paths.is_empty() {
-            None
-        } else {
-            Some(crate::takeout::index_explicit_sources(&paths).map_err(AppError::Other)?)
-        };
         let mut state = data
             .lock()
             .map_err(|error| AppError::Other(format!("Source index is unavailable: {error}")))?;
-        state.index = rebuilt;
-        Ok(true)
+        remove_source_from_preview_state(&mut state, &source_id).map_err(AppError::Other)
     })
     .await
     .map_err(|error| AppError::Other(format!("Could not remove source: {error}")))?
 }
 
 #[tauri::command]
-pub fn get_preview(
+pub async fn get_preview(
     settings: Settings,
     app: tauri::AppHandle,
     preview_state: State<'_, PreviewIndexState>,
 ) -> Result<PreviewResult> {
-    let (items, sample_items) = {
-        let state = preview_state
-            .0
-            .lock()
-            .map_err(|error| AppError::Other(format!("Preview index is unavailable: {error}")))?;
-        let Some(index) = state.index.as_ref() else {
-            return Ok(PreviewResult {
-                warnings: vec!["Add and scan Takeout files to see a real preview.".to_string()],
-                ..PreviewResult::default()
-            });
+    let index_state = preview_state.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (mut entries, sample_sources) = {
+            let state = index_state.lock().map_err(|error| {
+                AppError::Other(format!("Preview index is unavailable: {error}"))
+            })?;
+            let Some(index) = state.index.as_ref() else {
+                return Ok(PreviewResult {
+                    warnings: vec!["Add and scan Takeout files to see a real preview.".to_string()],
+                    ..PreviewResult::default()
+                });
+            };
+            let sample_sources = index
+                .preview_entries(8)
+                .map_err(AppError::Other)?
+                .into_iter()
+                .map(|entry| format!("{}::{}", entry.archive_path, entry.path))
+                .collect::<HashSet<_>>();
+            (
+                index.media_entries().map_err(AppError::Other)?,
+                sample_sources,
+            )
         };
-        let all_items = items_from_entries(index.media_entries().map_err(AppError::Other)?);
-        let sample_sources = index
-            .preview_entries(8)
-            .map_err(AppError::Other)?
-            .into_iter()
-            .map(|entry| format!("{}::{}", entry.archive_path, entry.path))
-            .collect::<HashSet<_>>();
-        let sample_items = all_items
+        hydrate_live_video_durations(&mut entries).map_err(AppError::Other)?;
+        let items = items_from_entries(entries);
+        let sample_items = items
             .iter()
             .filter(|item| sample_sources.contains(&item.source))
             .cloned()
             .collect::<Vec<_>>();
-        (all_items, sample_items)
-    };
 
-    let pictures = app.path().picture_dir().map_err(|error| {
-        AppError::Other(format!("Could not locate the Pictures folder: {error}"))
-    })?;
-    let output_root = resolve_output_root(&settings, &pictures)?;
-    let planner_settings =
-        PlannerSettings::from_preferences(&settings, Some(output_root.as_path()));
-    let placements = plan_with_existing_output(&items, &planner_settings, &output_root)?;
-    let sample_placements =
-        plan_with_existing_output(&sample_items, &planner_settings, &output_root)?;
-    let files = sample_placements
-        .iter()
-        .map(|placement| placement.dest.clone())
-        .collect();
-    let tree = organize::tree_from_placements(&output_root, &sample_placements);
-    let required_bytes =
-        crate::pipeline::estimate_required_bytes(&placements, &items).map_err(AppError::Other)?;
-    let free_bytes = crate::platform::disk_free_bytes(&output_root).map_err(AppError::Other)?;
+        let pictures = app.path().picture_dir().map_err(|error| {
+            AppError::Other(format!("Could not locate the Pictures folder: {error}"))
+        })?;
+        let output_root = resolve_output_root(&settings, &pictures)?;
+        let planner_settings =
+            PlannerSettings::from_preferences(&settings, Some(output_root.as_path()));
+        let placements = plan_with_existing_output(&items, &planner_settings, &output_root)?;
+        let sample_placements =
+            plan_with_existing_output(&sample_items, &planner_settings, &output_root)?;
+        let files = sample_placements
+            .iter()
+            .map(|placement| placement.dest.clone())
+            .collect();
+        let tree = organize::tree_from_placements(&output_root, &sample_placements);
+        let required_bytes = crate::pipeline::estimate_required_bytes(&placements, &items)
+            .map_err(AppError::Other)?;
+        let free_bytes = crate::platform::disk_free_bytes(&output_root).map_err(AppError::Other)?;
 
-    Ok(PreviewResult {
-        files,
-        tree,
-        warnings: Vec::new(),
-        required_bytes,
-        free_bytes,
+        Ok(PreviewResult {
+            files,
+            tree,
+            warnings: Vec::new(),
+            required_bytes,
+            free_bytes,
+        })
     })
+    .await
+    .map_err(|error| AppError::Other(format!("Could not build preview: {error}")))?
 }
 
 #[tauri::command]
@@ -126,7 +248,7 @@ pub async fn start_processing(
 ) -> Result<ProcessingStartResult> {
     let index = preview_state.0.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let (entries, all_entries, source_paths) = {
+        let (mut entries, all_entries, source_paths) = {
             let guard = index
                 .lock()
                 .map_err(|error| AppError::Other(format!("Source index is unavailable: {error}")))?;
@@ -141,6 +263,7 @@ pub async fn start_processing(
                 guard.source_paths.clone(),
             )
         };
+        hydrate_live_video_durations(&mut entries).map_err(AppError::Other)?;
         let input_locators = build_input_locators(&entries).map_err(AppError::Other)?;
         let items = items_from_entries(entries);
         if items.is_empty() {
@@ -262,22 +385,26 @@ pub fn cancel_processing() -> Result<bool> {
 }
 
 #[tauri::command]
-pub fn load_settings(app: tauri::AppHandle) -> Result<Settings> {
-    let path = app_config_file(&app, "settings.json")?;
-    let contents = match fs::read(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Settings::default())
-        }
-        Err(error) => {
-            return Err(AppError::Other(format!(
-                "Could not read settings {}: {error}",
-                path.display()
-            )));
-        }
-    };
-    serde_json::from_slice(&contents)
-        .map_err(|error| AppError::Other(format!("Could not parse settings: {error}")))
+pub async fn load_settings(app: tauri::AppHandle) -> Result<Settings> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = app_config_file(&app, "settings.json")?;
+        let contents = match fs::read(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Settings::default())
+            }
+            Err(error) => {
+                return Err(AppError::Other(format!(
+                    "Could not read settings {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        serde_json::from_slice(&contents)
+            .map_err(|error| AppError::Other(format!("Could not parse settings: {error}")))
+    })
+    .await
+    .map_err(|error| AppError::Other(format!("Could not load settings: {error}")))?
 }
 
 #[tauri::command]
@@ -305,19 +432,155 @@ pub async fn scan_sources(
     paths: Vec<String>,
     preview_state: State<'_, PreviewIndexState>,
 ) -> Result<crate::takeout::ScanSourcesResult> {
-    let index_state = preview_state.0.clone();
+    let data = preview_state.0.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let (result, index) =
-            crate::takeout::scan_paths_with_index(&paths).map_err(AppError::Other)?;
-        let mut state = index_state
+        let mut state = data
             .lock()
             .map_err(|error| AppError::Other(format!("Source index is unavailable: {error}")))?;
-        state.index = Some(index);
-        state.source_paths = paths;
-        Ok(result)
+        scan_into_preview_state(&mut state, &paths, None, &mut |_| Ok(()))
+            .map(|(result, _)| result)
+            .map_err(AppError::Other)
     })
     .await
     .map_err(|error| AppError::Other(format!("Could not scan sources: {error}")))?
+}
+
+#[tauri::command]
+pub fn start_scan(
+    paths: Vec<String>,
+    on_event: Channel<crate::events::ScanProgress>,
+    preview_state: State<'_, PreviewIndexState>,
+    scan_control: State<'_, ScanControlState>,
+) -> Result<String> {
+    let scan_id = format!(
+        "scan-{}-{}",
+        std::process::id(),
+        NEXT_SCAN_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let cancelled = Arc::new(AtomicBool::new(false));
+    {
+        let mut active = scan_control
+            .0
+            .lock()
+            .map_err(|error| AppError::Other(format!("Scan state is unavailable: {error}")))?;
+        if active.is_some() {
+            return Err(AppError::Other(
+                "A Takeout scan is already in progress.".to_string(),
+            ));
+        }
+        *active = Some(ActiveScan {
+            id: scan_id.clone(),
+            cancelled: cancelled.clone(),
+        });
+    }
+
+    let initial_event = crate::events::ScanProgress {
+        archive_index: 0,
+        archive_count: u32::try_from(paths.len()).unwrap_or(u32::MAX),
+        current_archive: String::new(),
+        entries_seen: 0,
+        bytes_read: 0,
+        total_bytes: 0,
+        stage: crate::events::ScanStage::Preparing,
+        result: None,
+        error: None,
+    };
+    if let Err(error) = on_event.send(initial_event) {
+        clear_active_scan(&scan_control.0, &scan_id);
+        return Err(AppError::Other(format!(
+            "Could not start scan progress channel: {error}"
+        )));
+    }
+
+    let index_state = preview_state.0.clone();
+    let control_state = scan_control.0.clone();
+    let task_scan_id = scan_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut latest_progress = None;
+        let mut emit_progress = |update: crate::takeout::ScanProgressUpdate| {
+            latest_progress = Some(update.clone());
+            on_event
+                .send(crate::events::ScanProgress {
+                    archive_index: update.archive_index,
+                    archive_count: update.archive_count,
+                    current_archive: update.current_archive,
+                    entries_seen: update.entries_seen,
+                    bytes_read: update.bytes_read,
+                    total_bytes: update.total_bytes,
+                    stage: crate::events::ScanStage::Scanning,
+                    result: None,
+                    error: None,
+                })
+                .map_err(|error| format!("Could not send scan progress: {error}"))
+        };
+        let scan_result = match index_state.lock() {
+            Ok(mut state) => scan_into_preview_state(
+                &mut state,
+                &paths,
+                Some(cancelled.as_ref()),
+                &mut emit_progress,
+            ),
+            Err(error) => Err(format!("Source index is unavailable: {error}")),
+        };
+        drop(emit_progress);
+
+        let mut terminal_progress = latest_progress.unwrap_or_default();
+        let (stage, result, error) = match scan_result {
+            Ok((result, progress)) if !cancelled.load(Ordering::SeqCst) => {
+                terminal_progress = progress;
+                (crate::events::ScanStage::Done, Some(result), None)
+            }
+            Ok(_) => (crate::events::ScanStage::Cancelled, None, None),
+            Err(error)
+                if cancelled.load(Ordering::SeqCst)
+                    || error == crate::takeout::SCAN_CANCELLED_ERROR =>
+            {
+                (crate::events::ScanStage::Cancelled, None, None)
+            }
+            Err(error) => (crate::events::ScanStage::Error, None, Some(error)),
+        };
+        let terminal = crate::events::ScanProgress {
+            archive_index: terminal_progress.archive_index,
+            archive_count: terminal_progress.archive_count,
+            current_archive: terminal_progress.current_archive,
+            entries_seen: terminal_progress.entries_seen,
+            bytes_read: terminal_progress.bytes_read,
+            total_bytes: terminal_progress.total_bytes,
+            stage,
+            result,
+            error,
+        };
+        if let Err(error) = on_event.send(terminal) {
+            eprintln!("Could not send final scan event: {error}");
+        }
+        clear_active_scan(&control_state, &task_scan_id);
+    });
+
+    Ok(scan_id)
+}
+
+#[tauri::command]
+pub fn cancel_scan(scan_control: State<'_, ScanControlState>) -> Result<bool> {
+    let active = scan_control
+        .0
+        .lock()
+        .map_err(|error| AppError::Other(format!("Scan state is unavailable: {error}")))?;
+    if let Some(scan) = active.as_ref() {
+        scan.cancelled.store(true, Ordering::SeqCst);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn clear_active_scan(state: &Arc<Mutex<Option<ActiveScan>>>, scan_id: &str) {
+    match state.lock() {
+        Ok(mut active) if active.as_ref().is_some_and(|scan| scan.id == scan_id) => {
+            *active = None;
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("Could not clear scan state: {error}"),
+    }
 }
 
 fn resolve_output_root(settings: &Settings, pictures: &Path) -> Result<PathBuf> {
@@ -345,6 +608,32 @@ fn plan_with_existing_output(
     ))
 }
 
+fn hydrate_live_video_durations(
+    entries: &mut [crate::archive::IndexedEntry],
+) -> std::result::Result<(), String> {
+    let photo_keys = entries
+        .iter()
+        .filter(|entry| entry.entry_type == crate::archive::EntryType::Photo)
+        .map(|entry| {
+            let (parent, base) = crate::takeout::matcher::live_path_key(&entry.path);
+            (entry.archive_path.to_lowercase(), parent, base)
+        })
+        .collect::<HashSet<_>>();
+    for entry in entries.iter_mut().filter(|entry| {
+        entry.entry_type == crate::archive::EntryType::Video
+            && entry.video_duration_seconds.is_none()
+    }) {
+        let (parent, base) = crate::takeout::matcher::live_path_key(&entry.path);
+        if photo_keys.contains(&(entry.archive_path.to_lowercase(), parent, base)) {
+            entry.video_duration_seconds = crate::takeout::read_video_duration_seconds(
+                &entry.archive_path,
+                &entry.entry_path,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn items_from_entries(entries: Vec<crate::archive::IndexedEntry>) -> Vec<MediaItem> {
     let candidates = entries
         .iter()
@@ -368,7 +657,7 @@ fn items_from_entries(entries: Vec<crate::archive::IndexedEntry>) -> Vec<MediaIt
                     .as_ref()
                     .and_then(crate::metadata::TakeoutMetadata::taken_timestamp),
                 duration_seconds: entry.video_duration_seconds,
-                embedded_video_verified: entry.embedded_motion_video,
+                embedded_motion_marker: entry.embedded_motion_video,
             }
         })
         .collect::<Vec<_>>();
@@ -470,6 +759,7 @@ fn build_input_locators(
                 source,
                 archive_path: entry.archive_path.clone(),
                 entry_path: entry.entry_path.clone(),
+                video_duration_seconds: entry.video_duration_seconds,
             },
         );
     }
@@ -582,20 +872,43 @@ pub fn resume_run() -> Result<bool> {
 }
 
 #[tauri::command]
-pub fn get_report(app: tauri::AppHandle) -> Result<Option<ReportDocument>> {
-    let path = app_config_file(&app, "last-report.json")?;
+pub async fn get_report(app: tauri::AppHandle) -> Result<Option<ReportDocument>> {
+    tauri::async_runtime::spawn_blocking(move || load_report(&app))
+        .await
+        .map_err(|error| AppError::Other(format!("Could not load report: {error}")))?
+}
+
+#[tauri::command]
+pub async fn get_review_items(app: tauri::AppHandle) -> Result<Vec<ReportItem>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(load_report(&app)?
+            .map(|report| report.items)
+            .unwrap_or_default())
+    })
+    .await
+    .map_err(|error| AppError::Other(format!("Could not load review items: {error}")))?
+}
+
+#[tauri::command]
+pub async fn apply_review_fix(
+    item_id: String,
+    choice: String,
+    picked_date: Option<String>,
+    app: tauri::AppHandle,
+) -> Result<bool> {
+    tauri::async_runtime::spawn_blocking(move || {
+        apply_review_fix_blocking(item_id, choice, picked_date, app)
+    })
+    .await
+    .map_err(|error| AppError::Other(format!("Could not apply review fix: {error}")))?
+}
+
+fn load_report(app: &tauri::AppHandle) -> Result<Option<ReportDocument>> {
+    let path = app_config_file(app, "last-report.json")?;
     ReportDocument::load(&path).map_err(AppError::Other)
 }
 
-#[tauri::command]
-pub fn get_review_items(app: tauri::AppHandle) -> Result<Vec<ReportItem>> {
-    Ok(get_report(app)?
-        .map(|report| report.items)
-        .unwrap_or_default())
-}
-
-#[tauri::command]
-pub fn apply_review_fix(
+fn apply_review_fix_blocking(
     item_id: String,
     choice: String,
     picked_date: Option<String>,
@@ -736,6 +1049,145 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
     use zip::write::FileOptions;
+
+    fn write_index_test_archive(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = fs::File::create(path).expect("create test archive");
+        let mut archive = zip::ZipWriter::new(file);
+        let options = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (entry_path, contents) in entries {
+            archive
+                .start_file(*entry_path, options)
+                .expect("start test entry");
+            archive.write_all(contents).expect("write test entry");
+        }
+        archive.finish().expect("finish test archive");
+    }
+
+    fn movie_with_duration() -> Vec<u8> {
+        fn atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
+            bytes.extend_from_slice(kind);
+            bytes.extend_from_slice(payload);
+            bytes
+        }
+
+        let mut header = vec![0, 0, 0, 0];
+        header.extend_from_slice(&0_u32.to_be_bytes());
+        header.extend_from_slice(&0_u32.to_be_bytes());
+        header.extend_from_slice(&1_000_u32.to_be_bytes());
+        header.extend_from_slice(&2_500_u32.to_be_bytes());
+        atom(b"moov", &atom(b"mvhd", &header))
+    }
+
+    #[test]
+    fn preview_index_incrementally_adds_and_removes_archives() {
+        let directory = tempdir().expect("create preview-index test folder");
+        let media_archive = directory.path().join("media.zip");
+        let sidecar_archive = directory.path().join("sidecar.zip");
+        let media_entry = "Takeout/Google Photos/Photos from 2021/photo.jpg";
+        write_index_test_archive(&media_archive, &[(media_entry, b"photo")]);
+        write_index_test_archive(
+            &sidecar_archive,
+            &[(
+                "Takeout/Google Photos/Photos from 2021/photo.jpg.json",
+                br#"{"title":"photo.jpg"}"#,
+            )],
+        );
+        let media_path = media_archive.to_string_lossy().into_owned();
+        let sidecar_path = sidecar_archive.to_string_lossy().into_owned();
+        let mut state = PreviewIndexData::default();
+
+        scan_into_preview_state(&mut state, &[media_path.clone()], None, &mut |_| Ok(()))
+            .expect("index first archive");
+        assert_eq!(
+            state.indexed_archives.get(&archive_index_key(&media_path)),
+            Some(&true)
+        );
+
+        let index_address = state
+            .index
+            .as_ref()
+            .map(|index| index as *const crate::takeout::TempIndex as usize);
+        write_index_test_archive(
+            &media_archive,
+            &[
+                (media_entry, b"photo"),
+                (
+                    "Takeout/Google Photos/Photos from 2021/new.jpg",
+                    b"new photo",
+                ),
+            ],
+        );
+        scan_into_preview_state(
+            &mut state,
+            &[media_path.clone(), sidecar_path.clone()],
+            None,
+            &mut |_| Ok(()),
+        )
+        .expect("index only newly added archive");
+
+        let index = state.index.as_ref().expect("persistent temp index");
+        assert_eq!(
+            state
+                .index
+                .as_ref()
+                .map(|index| index as *const crate::takeout::TempIndex as usize),
+            index_address
+        );
+        let media_entries = index.media_entries().expect("read indexed media");
+        assert_eq!(media_entries.len(), 1);
+        assert_eq!(
+            media_entries[0].sidecar_archive_path.as_deref(),
+            Some(sidecar_path.as_str())
+        );
+
+        let removal = remove_source_from_preview_state(&mut state, &sidecar_path)
+            .expect("remove sidecar archive");
+        assert_eq!(removal.files, vec![media_path.clone()]);
+        assert_eq!(removal.counts.photos, 1);
+        let remaining_media = state
+            .index
+            .as_ref()
+            .expect("keep temp index after removal")
+            .media_entries()
+            .expect("read remaining media");
+        assert_eq!(remaining_media.len(), 1);
+        assert_eq!(remaining_media[0].sidecar_path, None);
+        assert!(!state
+            .indexed_archives
+            .contains_key(&archive_index_key(&sidecar_path)));
+    }
+
+    #[test]
+    fn live_duration_hydration_reads_only_same_folder_video_candidates() {
+        let directory = tempdir().expect("create duration candidate folder");
+        let photos = directory.path().join("Photos");
+        fs::create_dir_all(&photos).expect("create Photos folder");
+        fs::write(photos.join("IMG_1.jpg"), b"synthetic photo").expect("write photo");
+        fs::write(photos.join("IMG_1.mov"), movie_with_duration()).expect("write candidate video");
+        fs::write(photos.join("IMG_2.mov"), movie_with_duration()).expect("write unmatched video");
+
+        let mut entries = crate::takeout::index_explicit_sources(&[directory
+            .path()
+            .to_string_lossy()
+            .into_owned()])
+        .expect("index synthetic folder")
+        .media_entries()
+        .expect("read indexed media");
+        hydrate_live_video_durations(&mut entries).expect("read candidate duration");
+
+        let candidate = entries
+            .iter()
+            .find(|entry| entry.path.ends_with("IMG_1.mov"))
+            .expect("find same-name video");
+        let unmatched = entries
+            .iter()
+            .find(|entry| entry.path.ends_with("IMG_2.mov"))
+            .expect("find unmatched video");
+        assert_eq!(candidate.video_duration_seconds, Some(2.5));
+        assert_eq!(unmatched.video_duration_seconds, None);
+    }
 
     #[test]
     fn sample_takeout_archive_runs_through_index_plan_and_output() {

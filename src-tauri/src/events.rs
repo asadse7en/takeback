@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 use crate::error::{AppError, Result};
+use crate::takeout::ScanSourcesResult;
 
 pub const PROCESSING_PROGRESS_EVENT: &str = "processing:progress";
 
@@ -26,10 +27,26 @@ pub fn emit_processing_progress(app: &AppHandle, progress: &ProcessingProgressEv
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct ScanProgressEvent {
-    pub processed: u32,
-    pub total: u32,
-    pub message: String,
+pub struct ScanProgress {
+    pub archive_index: u32,
+    pub archive_count: u32,
+    pub current_archive: String,
+    pub entries_seen: u64,
+    pub bytes_read: u64,
+    pub total_bytes: u64,
+    pub stage: ScanStage,
+    pub result: Option<ScanSourcesResult>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ScanStage {
+    Preparing,
+    Scanning,
+    Done,
+    Cancelled,
+    Error,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

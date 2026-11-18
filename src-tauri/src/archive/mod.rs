@@ -27,6 +27,7 @@ pub struct SourceRecord {
     pub archive_type: ArchiveType,
     pub size_bytes: u64,
     pub entry_count: u64,
+    pub entry_count_known: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

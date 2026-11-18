@@ -5,14 +5,22 @@ use takeback_lib::takeout::matcher::{
 };
 
 #[test]
-fn live_photo_fixture_matches_only_confident_pairs_and_warns_on_uncertainty() {
+fn live_photo_fixture_pairs_unknown_durations_by_name_and_folder() {
     let raw = fs::read_to_string("tests/fixtures/live_photo_cases.json").unwrap();
     let candidates: Vec<LivePhotoCandidate> = serde_json::from_str(&raw).unwrap();
     let detection = match_live_photos(&candidates);
 
-    assert_eq!(detection.pairs.len(), 1);
-    assert_eq!(detection.pairs[0].photo_path, "Photos/IMG_100.jpg");
-    assert_eq!(detection.pairs[0].video_path, "Photos/IMG_100.mov");
+    assert_eq!(detection.pairs.len(), 3);
+    for (photo, video) in [
+        ("Photos/IMG_100.jpg", "Photos/IMG_100.mov"),
+        ("Photos/IMG_400.jpg", "Photos/IMG_400.mp4"),
+        ("Photos/IMG_700.jpg", "Photos/IMG_700.mp4"),
+    ] {
+        assert!(detection
+            .pairs
+            .iter()
+            .any(|pair| { pair.photo_path == photo && pair.video_path == video }));
+    }
     assert_eq!(
         detection.embedded_motion_photos,
         vec!["Photos/IMG_500.MP.jpg"]
@@ -21,21 +29,13 @@ fn live_photo_fixture_matches_only_confident_pairs_and_warns_on_uncertainty() {
         warning.message.contains("different folders")
             && warning.paths.contains(&"Album A/IMG_300.jpg".to_string())
     }));
-    assert!(detection
-        .warnings
-        .iter()
-        .any(|warning| warning.paths.contains(&"Photos/IMG_400.jpg".to_string())));
     assert!(detection.warnings.iter().any(|warning| {
-        warning.message.contains("Could not verify")
+        warning.message.contains("No Motion Photo XMP marker")
             && warning.paths.contains(&"Photos/IMG_600.MP.jpg".to_string())
     }));
     assert!(detection.warnings.iter().any(|warning| {
         warning.message.contains("More than one")
             && warning.paths.contains(&"Photos/IMG_200.png".to_string())
-    }));
-    assert!(detection.warnings.iter().any(|warning| {
-        warning.message.contains("duration could not be verified")
-            && warning.paths.contains(&"Photos/IMG_700.mp4".to_string())
     }));
     assert!(detection.warnings.iter().any(|warning| {
         warning.message.contains("longer than a typical live photo")

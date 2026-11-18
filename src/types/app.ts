@@ -60,6 +60,7 @@ export type ScanState = {
     archiveType: 'zip' | 'tgz' | 'folder';
     sizeBytes: number;
     entryCount: number;
+    entryCountKnown: boolean;
   }[];
   counts: {
     photos: number;

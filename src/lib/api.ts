@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import type { Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { Settings } from '@/types/app';
 
@@ -8,6 +9,7 @@ export type SourceRecord = {
   archiveType: 'zip' | 'tgz' | 'folder';
   sizeBytes: number;
   entryCount: number;
+  entryCountKnown: boolean;
 };
 
 export type AddSourcesResult = {
@@ -19,6 +21,18 @@ export type ScanSourcesResult = {
   files: string[];
   counts: { photos: number; videos: number; live: number; totalGb: number };
   warnings: string[];
+};
+
+export type ScanProgress = {
+  archiveIndex: number;
+  archiveCount: number;
+  currentArchive: string;
+  entriesSeen: number;
+  bytesRead: number;
+  totalBytes: number;
+  stage: 'preparing' | 'scanning' | 'done' | 'cancelled' | 'error';
+  result: ScanSourcesResult | null;
+  error: string | null;
 };
 
 export type PreviewNode = {
@@ -104,7 +118,12 @@ export type ProcessingProgress = {
 export type BackendCommandContracts = {
   add_sources: { args: { paths: string[] }; result: AddSourcesResult };
   scan_sources: { args: { paths: string[] }; result: ScanSourcesResult };
-  remove_source: { args: { sourceId: string }; result: boolean };
+  start_scan: {
+    args: { paths: string[]; onEvent: Channel<ScanProgress> };
+    result: string;
+  };
+  cancel_scan: { args: Record<string, never>; result: boolean };
+  remove_source: { args: { sourceId: string }; result: ScanSourcesResult };
   get_preview: { args: { settings: Settings }; result: PreviewResult };
   start_processing: { args: { settings: Settings }; result: ProcessingStartResult };
   cancel_processing: { args: Record<string, never>; result: boolean };

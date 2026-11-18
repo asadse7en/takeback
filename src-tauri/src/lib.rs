@@ -16,6 +16,7 @@ pub mod takeout;
 pub fn run() {
     tauri::Builder::default()
         .manage(commands::PreviewIndexState::default())
+        .manage(commands::ScanControlState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -28,6 +29,8 @@ pub fn run() {
             commands::save_settings,
             commands::export_report,
             commands::scan_sources,
+            commands::start_scan,
+            commands::cancel_scan,
             commands::pause_run,
             commands::resume_run,
             commands::get_report,
