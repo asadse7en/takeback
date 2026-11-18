@@ -1,6 +1,6 @@
 pub mod live;
 
-pub use live::{apply_live_style, LiveStyle};
+pub use live::apply_live_style;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -15,12 +15,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
+use crate::livephoto::LivePhotoStyle;
 use crate::manifest::{self, RunManifest};
 use crate::metadata::{
-    is_large_metadata_video, supports_embedded_metadata, ExifTool, MetadataWriteRequest,
-    TakeoutMetadata,
+    is_large_video, supports_embedded_metadata, ExifTool, MetadataWriteRequest, TakeoutMetadata,
 };
-use crate::planner::{self, MediaItem, Placement, PlannerSettings};
+use crate::planner::{self, LiveAction, MediaItem, Placement, PlannerSettings};
 use crate::platform::disk_free_bytes;
 use crate::report::ReportItem;
 use crate::takeout::Source;
@@ -277,11 +277,9 @@ pub fn start_run(
     let has_metadata =
         !settings.dry_run && !placements.is_empty() && items.iter().any(requires_exiftool_metadata);
     let has_live_photo_writes = !settings.dry_run
-        && placements.iter().any(|placement| {
-            placement.tags.iter().any(|tag| {
-                tag.starts_with("LivePhotoIphone:") || tag.starts_with("LivePhotoAndroid:")
-            })
-        });
+        && placements
+            .iter()
+            .any(|placement| placement.live_action.is_some());
     let mut exiftool = if has_metadata || has_live_photo_writes {
         Some(ExifTool::new(exiftool_path)?)
     } else {
@@ -604,7 +602,9 @@ fn start_indexed_run_inner(
             .filter(|item| (item.is_photo || item.is_video) && !item.has_json)
             .count() as u32,
         other_files: count_other_files(items, placements),
-        live_photos_merged: if settings.merge_live && settings.live_style != "separate" {
+        live_photos_merged: if settings.merge_live
+            && settings.live_style != LivePhotoStyle::Separate
+        {
             items
                 .iter()
                 .filter(|item| item.live_pair_partner.is_some() && !item.live_pair_video)
@@ -649,11 +649,10 @@ fn start_indexed_run_inner(
 
     let needs_exiftool = tasks.iter().any(|task| {
         requires_exiftool_metadata(&task.item)
-            || task.placements.iter().any(|placement| {
-                placement.tags.iter().any(|tag| {
-                    tag.starts_with("LivePhotoIphone:") || tag.starts_with("LivePhotoAndroid:")
-                })
-            })
+            || task
+                .placements
+                .iter()
+                .any(|placement| placement.live_action.is_some())
     });
     let cpu_count = thread::available_parallelism()
         .map(usize::from)
@@ -1043,7 +1042,6 @@ struct PlacementCompletion {
     result: Result<PlacementResult, String>,
     metadata_request: Option<MetadataWriteRequest>,
     deferred_temp: Option<tempfile::TempPath>,
-    deferred_temp: Option<tempfile::TempPath>,
 }
 
 const PAUSED_WRITE_MARKER: &str = "Takeback paused before output could be finalized.";
@@ -1176,6 +1174,20 @@ fn flush_metadata_batch(
 ) -> Result<(), String> {
     if pending.is_empty() {
         return Ok(());
+    }
+    if let Err(error) = wait_for_run_resume() {
+        if error == "Processing was cancelled." {
+            for mut completion in pending.drain(..) {
+                completion.result = Err(error.clone());
+                completion.metadata_request = None;
+                completion.deferred_temp = None;
+                sender.send(completion).map_err(|send_error| {
+                    format!("return cancelled metadata result: {send_error}")
+                })?;
+            }
+            return Ok(());
+        }
+        return Err(error);
     }
 
     let requests = pending
@@ -1387,7 +1399,7 @@ fn count_other_files(items: &[MediaItem], placements: &[Placement]) -> u32 {
 fn requires_exiftool_metadata(item: &MediaItem) -> bool {
     item.metadata.is_some()
         && supports_embedded_metadata(Path::new(&item.filename))
-        && !is_large_metadata_video(Path::new(&item.filename), item.size_bytes)
+        && !is_large_video(Path::new(&item.filename), item.size_bytes)
 }
 
 fn placement_manifest_identity(
@@ -1554,20 +1566,18 @@ fn write_placement_with_sources(
     }
 
     if metadata_output && linked_output.is_none() {
-        if supports_embedded_metadata(dest) {
-            let metadata = metadata.ok_or_else(|| "missing Takeout metadata".to_string())?;
-            let temp_size = fs::metadata(tmp_path)
-                .map_err(|error| {
-                    format!("inspect temporary output {}: {error}", tmp_path.display())
-                })?
-                .len();
-            if is_large_metadata_video(dest, temp_size) {
-                set_taken_file_time(tmp_path, metadata)?;
-                result.warnings.push(
-                    "ExifTool metadata rewrite was skipped for a video over 500 MB; only the file modified time was set when available."
-                        .to_string(),
-                );
-            } else if batch_metadata {
+        let metadata = metadata.ok_or_else(|| "missing Takeout metadata".to_string())?;
+        let temp_size = fs::metadata(tmp_path)
+            .map_err(|error| format!("inspect temporary output {}: {error}", tmp_path.display()))?
+            .len();
+        if is_large_video(dest, temp_size) {
+            set_taken_file_time(tmp_path, metadata)?;
+            result.warnings.push(
+                "ExifTool metadata rewrite was skipped for a video over 500 MB; only the file modified time was set when available."
+                    .to_string(),
+            );
+        } else if supports_embedded_metadata(dest) {
+            if batch_metadata {
                 *deferred_metadata = Some(MetadataWriteRequest {
                     path: tmp_path.to_path_buf(),
                     metadata: metadata.clone(),
@@ -1603,7 +1613,7 @@ fn write_placement_with_sources(
                     }
                 }
             }
-        } else if let Some(metadata) = metadata {
+        } else {
             set_taken_file_time(tmp_path, metadata)?;
             result.warnings.push(format!(
                 "Metadata is not safely supported for {}; the file was copied without metadata.",
@@ -1612,85 +1622,76 @@ fn write_placement_with_sources(
         }
     }
 
-    if let Some(tag) = placement
-        .tags
-        .iter()
-        .find(|tag| tag.starts_with("LivePhotoIphone:"))
-    {
-        let content_identifier = tag
-            .strip_prefix("LivePhotoIphone:")
-            .ok_or_else(|| "invalid iPhone live photo action".to_string())?;
+    if let Some(action) = &placement.live_action {
         let writer = exiftool
             .as_mut()
             .ok_or_else(|| "bundled ExifTool is not available for live photo writes".to_string())?;
-        apply_live_style(
-            writer,
-            LiveStyle::Iphone,
-            tmp_path,
-            None,
-            content_identifier,
-        )?;
-    } else if let Some(tag) = placement
-        .tags
-        .iter()
-        .find(|tag| tag.starts_with("LivePhotoAndroid:"))
-    {
-        let action = tag
-            .strip_prefix("LivePhotoAndroid:")
-            .ok_or_else(|| "invalid Android Motion Photo action".to_string())?;
-        let (content_identifier, video_source) = action
-            .split_once(':')
-            .ok_or_else(|| "Android Motion Photo action has no video source".to_string())?;
-        let writer = exiftool
-            .as_mut()
-            .ok_or_else(|| "bundled ExifTool is not available for live photo writes".to_string())?;
-        let video_temp = if input_locators.contains_key(video_source) {
-            let temp = temp_path_for(dest)?;
-            let video_temp_path: &Path = temp.as_ref();
-            copy_source_into_temp(video_source, video_temp_path, input_locators, zip_archives)?;
-            let duration_is_unknown = input_locators
-                .get(video_source)
-                .is_some_and(|locator| locator.video_duration_seconds.is_none());
-            if duration_is_unknown {
-                let metadata = fs::metadata(video_temp_path).map_err(|error| {
-                    format!(
-                        "read extracted video metadata {}: {error}",
-                        video_temp_path.display()
-                    )
-                })?;
-                let mut file = fs::File::open(video_temp_path).map_err(|error| {
-                    format!(
-                        "open extracted video {}: {error}",
-                        video_temp_path.display()
-                    )
-                })?;
-                if crate::takeout::matcher::read_video_duration_from_seekable(
-                    &mut file,
-                    metadata.len(),
-                )?
-                .is_none()
-                {
-                    result.warnings.push(format!(
-                        "Could not determine the duration of {}; the live pair was kept by matching name and folder.",
-                        video_source
-                    ));
-                }
+        match action {
+            LiveAction::IphonePair { content_identifier } => apply_live_style(
+                writer,
+                LivePhotoStyle::IphonePair,
+                tmp_path,
+                None,
+                content_identifier,
+            )?,
+            LiveAction::AndroidMotionPhoto {
+                content_identifier,
+                video_source,
+            } => {
+                let video_temp = if input_locators.contains_key(video_source) {
+                    let temp = temp_path_for(dest)?;
+                    let video_temp_path: &Path = temp.as_ref();
+                    copy_source_into_temp(
+                        video_source,
+                        video_temp_path,
+                        input_locators,
+                        zip_archives,
+                    )?;
+                    let duration_is_unknown = input_locators
+                        .get(video_source)
+                        .is_some_and(|locator| locator.video_duration_seconds.is_none());
+                    if duration_is_unknown {
+                        let metadata = fs::metadata(video_temp_path).map_err(|error| {
+                            format!(
+                                "read extracted video metadata {}: {error}",
+                                video_temp_path.display()
+                            )
+                        })?;
+                        let mut file = fs::File::open(video_temp_path).map_err(|error| {
+                            format!(
+                                "open extracted video {}: {error}",
+                                video_temp_path.display()
+                            )
+                        })?;
+                        if crate::takeout::matcher::read_video_duration_from_seekable(
+                            &mut file,
+                            metadata.len(),
+                        )?
+                        .is_none()
+                        {
+                            result.warnings.push(format!(
+                                "Could not determine the duration of {}; the live pair was kept by matching name and folder.",
+                                video_source
+                            ));
+                        }
+                    }
+                    Some(temp)
+                } else {
+                    None
+                };
+                let video_path = video_temp
+                    .as_ref()
+                    .map(|temp| temp.as_ref())
+                    .unwrap_or_else(|| Path::new(video_source));
+                apply_live_style(
+                    writer,
+                    LivePhotoStyle::AndroidMotionPhoto,
+                    tmp_path,
+                    Some(video_path),
+                    content_identifier,
+                )?;
             }
-            Some(temp)
-        } else {
-            None
-        };
-        let video_path = video_temp
-            .as_ref()
-            .map(|temp| temp.as_ref())
-            .unwrap_or_else(|| Path::new(video_source));
-        apply_live_style(
-            writer,
-            LiveStyle::Android,
-            tmp_path,
-            Some(video_path),
-            content_identifier,
-        )?;
+        }
     }
     if let Some(metadata) = metadata {
         set_taken_file_time(tmp_path, metadata)?;
@@ -1952,6 +1953,99 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn deferred_metadata_keeps_outputs_temporary_until_batch_completion() {
+        let directory = tempdir().expect("create output directory");
+        let source = directory.path().join("source.jpg");
+        let destination = directory.path().join("output.jpg");
+        fs::write(&source, b"original photo").expect("write source");
+        let temporary = tempfile::Builder::new()
+            .prefix(".takeback-")
+            .suffix(".jpg")
+            .tempfile_in(directory.path())
+            .expect("create temporary output");
+        fs::write(temporary.path(), b"rewritten photo").expect("write temporary output");
+        let temporary_path = temporary.into_temp_path();
+        let source_key = source.to_string_lossy().to_string();
+        let item = MediaItem {
+            source: source_key.clone(),
+            filename: "source.jpg".to_string(),
+            album: None,
+            additional_albums: Vec::new(),
+            date: None,
+            time: None,
+            tz: None,
+            size_bytes: 14,
+            is_photo: true,
+            is_video: false,
+            is_live: false,
+            live_pair_partner: None,
+            live_content_identifier: None,
+            live_pair_video: false,
+            embedded_motion_video: false,
+            live_warning: None,
+            favorite: false,
+            archived: false,
+            trashed: false,
+            edited: false,
+            has_json: true,
+            duplicate_of: None,
+            metadata: Some(TakeoutMetadata::default()),
+        };
+        let placement = Placement {
+            src: source_key.clone(),
+            dest: destination.to_string_lossy().to_string(),
+            kind: PlacementKind::Original,
+            tags: Vec::new(),
+            live_action: None,
+        };
+        let request = MetadataWriteRequest {
+            path: temporary_path.to_path_buf(),
+            metadata: TakeoutMetadata::default(),
+            time_zone: TimeZoneMode::Utc,
+            timezone_name: None,
+            write_gps: false,
+            write_descriptions: false,
+            rate_favorites: false,
+        };
+        let mut pending = vec![PlacementCompletion {
+            item,
+            archive_path: String::new(),
+            placement,
+            result: Ok(PlacementResult::default()),
+            metadata_request: Some(request),
+            deferred_temp: Some(temporary_path),
+        }];
+        let (sender, receiver) = mpsc::channel();
+        let mut exiftool = None;
+        let mut processed_outputs = HashMap::new();
+        let mut zip_archives = WorkerZipCache::new();
+        run_control().lock().expect("lock run control").reset();
+
+        flush_metadata_batch(
+            &mut exiftool,
+            &sender,
+            &mut pending,
+            &mut processed_outputs,
+            &mut zip_archives,
+            &HashMap::new(),
+        )
+        .expect("flush metadata batch");
+        let completion = receiver.recv().expect("receive completed output");
+
+        assert_eq!(
+            fs::read(&destination).expect("read restored destination"),
+            b"original photo"
+        );
+        assert!(completion
+            .result
+            .expect("metadata warning is non-fatal")
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("original file was preserved")));
+        assert_eq!(processed_outputs.get(&source_key), Some(&destination));
+    }
+
+    #[test]
     fn metadata_write_keeps_unsupported_input_unchanged() {
         let directory = tempdir().expect("create output directory");
         let source = directory.path().join("source.bin");
@@ -1967,6 +2061,7 @@ mod tests {
             dest: destination.to_string_lossy().to_string(),
             kind: PlacementKind::Link,
             tags: vec!["Link".to_string()],
+            live_action: None,
         };
         let settings = PlannerSettings {
             time_zone: TimeZoneMode::Utc,
@@ -2022,6 +2117,7 @@ mod tests {
             dest: destination.to_string_lossy().to_string(),
             kind: PlacementKind::Original,
             tags: Vec::new(),
+            live_action: None,
         };
         let mut exiftool = None;
         let mut processed_outputs = HashMap::new();
@@ -2144,6 +2240,7 @@ mod tests {
                 .to_string(),
             kind: PlacementKind::Original,
             tags: Vec::new(),
+            live_action: None,
         };
         let source: Arc<dyn Source> = crate::takeout::create_source(&source_root)
             .expect("create folder source")
@@ -2221,6 +2318,7 @@ mod tests {
             dest: destination.to_string_lossy().to_string(),
             kind: PlacementKind::Original,
             tags: Vec::new(),
+            live_action: None,
         };
         let mut settings = PlannerSettings::default();
         settings.output_root = Some(output_root.to_string_lossy().to_string());

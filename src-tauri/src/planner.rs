@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Datelike;
 
+use crate::livephoto::LivePhotoStyle;
 use crate::manifest;
 use crate::metadata::TakeoutMetadata;
 use crate::settings::{self, Settings};
@@ -142,7 +143,7 @@ pub struct PlannerSettings {
     pub trashed: TrashedMode,
     pub edited_versions: EditedVersions,
     pub merge_live: bool,
-    pub live_style: String,
+    pub live_style: LivePhotoStyle,
     pub split_by_type: SplitByType,
     pub file_names: String,
     pub custom_name_pattern: String,
@@ -173,7 +174,7 @@ impl Default for PlannerSettings {
             trashed: TrashedMode::Skip,
             edited_versions: EditedVersions::Both,
             merge_live: true,
-            live_style: "separate".to_string(),
+            live_style: LivePhotoStyle::Separate,
             split_by_type: SplitByType {
                 photos: false,
                 videos: false,
@@ -283,12 +284,7 @@ impl PlannerSettings {
                 settings::EditedVersions::Edited => EditedVersions::Edited,
             },
             merge_live: settings.merge_live,
-            live_style: match settings.live_style {
-                crate::livephoto::LivePhotoStyle::Separate => "separate",
-                crate::livephoto::LivePhotoStyle::IphonePair => "iphonePair",
-                crate::livephoto::LivePhotoStyle::AndroidMotionPhoto => "androidMotionPhoto",
-            }
-            .to_string(),
+            live_style: settings.live_style,
             split_by_type: SplitByType {
                 photos: settings.split_by_type.photos,
                 videos: settings.split_by_type.videos,
@@ -342,6 +338,19 @@ pub struct Placement {
     pub dest: String,
     pub kind: PlacementKind,
     pub tags: Vec<String>,
+    pub live_action: Option<LiveAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LiveAction {
+    IphonePair {
+        content_identifier: String,
+    },
+    AndroidMotionPhoto {
+        content_identifier: String,
+        video_source: String,
+    },
 }
 
 pub fn preview(settings: &PlannerSettings) -> Vec<String> {
@@ -423,7 +432,7 @@ pub fn destination_directories(
             continue;
         }
         if settings.merge_live
-            && settings.live_style == "androidMotionPhoto"
+            && settings.live_style == LivePhotoStyle::AndroidMotionPhoto
             && item.live_pair_video
         {
             continue;
@@ -541,7 +550,7 @@ pub fn plan_with_root_and_manifest(
         }
 
         if settings.merge_live
-            && settings.live_style == "androidMotionPhoto"
+            && settings.live_style == LivePhotoStyle::AndroidMotionPhoto
             && item.live_pair_video
         {
             continue;
@@ -719,21 +728,27 @@ pub fn plan_with_root_and_manifest(
             continue;
         };
         if settings.merge_live {
-            if let Some(identifier) = item.live_content_identifier.as_deref() {
-                if matches!(settings.live_style.as_str(), "iphonePair" | "iphone") {
-                    placement.tags.push(format!("LivePhotoIphone:{identifier}"));
+            placement.live_action = match settings.live_style {
+                LivePhotoStyle::Separate => None,
+                LivePhotoStyle::IphonePair => {
+                    item.live_content_identifier
+                        .as_ref()
+                        .map(|content_identifier| LiveAction::IphonePair {
+                            content_identifier: content_identifier.clone(),
+                        })
                 }
-            }
-            if !item.live_pair_video && matches!(settings.live_style.as_str(), "androidMotionPhoto")
-            {
-                if let Some(video_source) = item.live_pair_partner.as_deref() {
-                    if let Some(identifier) = item.live_content_identifier.as_deref() {
-                        placement
-                            .tags
-                            .push(format!("LivePhotoAndroid:{identifier}:{video_source}"));
-                    }
-                }
-            }
+                LivePhotoStyle::AndroidMotionPhoto if !item.live_pair_video => item
+                    .live_pair_partner
+                    .as_ref()
+                    .zip(item.live_content_identifier.as_ref())
+                    .map(
+                        |(video_source, content_identifier)| LiveAction::AndroidMotionPhoto {
+                            content_identifier: content_identifier.clone(),
+                            video_source: video_source.clone(),
+                        },
+                    ),
+                LivePhotoStyle::AndroidMotionPhoto => None,
+            };
         }
         if let Some(warning) = item.live_warning.as_deref() {
             placement.tags.push(format!("LivePhotoWarning:{warning}"));
@@ -864,6 +879,7 @@ fn original_placement(
             dest: destination,
             kind: PlacementKind::Original,
             tags: vec![],
+            live_action: None,
         });
     }
     let filename = unique_path_name(&directory, item, None, settings, occupied)?;
@@ -872,6 +888,7 @@ fn original_placement(
         dest: directory.join(filename).to_string_lossy().into_owned(),
         kind: PlacementKind::Original,
         tags: vec![],
+        live_action: None,
     })
 }
 
@@ -906,6 +923,7 @@ fn extra_placement(
             dest: destination,
             kind,
             tags,
+            live_action: None,
         });
     }
     let filename = unique_path_name(&directory, item, album_override, settings, occupied)?;
@@ -914,6 +932,7 @@ fn extra_placement(
         dest: directory.join(filename).to_string_lossy().into_owned(),
         kind,
         tags,
+        live_action: None,
     })
 }
 
@@ -1321,7 +1340,7 @@ mod tests {
         assert_eq!(mapped.custom_name_pattern, "{date}_{n}_{original}_{album}");
         assert_eq!(mapped.same_name, SameNameMode::Skip);
         assert_eq!(mapped.rate_favorites, preferences.rate_favorites);
-        assert_eq!(mapped.live_style, "separate");
+        assert_eq!(mapped.live_style, LivePhotoStyle::Separate);
     }
 
     #[test]
@@ -1419,40 +1438,45 @@ mod tests {
         let separate = plan(
             &items,
             &PlannerSettings {
-                live_style: "separate".to_string(),
+                live_style: LivePhotoStyle::Separate,
                 ..common.clone()
             },
         );
         assert_eq!(separate.len(), 2);
-        assert!(separate.iter().all(|placement| !placement
-            .tags
+        assert!(separate
             .iter()
-            .any(|tag| tag.starts_with("LivePhoto"))));
+            .all(|placement| placement.live_action.is_none()));
 
         let iphone = plan(
             &items,
             &PlannerSettings {
-                live_style: "iphonePair".to_string(),
+                live_style: LivePhotoStyle::IphonePair,
                 ..common.clone()
             },
         );
         assert_eq!(iphone.len(), 2);
-        assert!(iphone.iter().all(|placement| placement
-            .tags
-            .contains(&"LivePhotoIphone:takeback-live-id".to_string())));
+        assert!(iphone.iter().all(|placement| {
+            placement.live_action
+                == Some(LiveAction::IphonePair {
+                    content_identifier: "takeback-live-id".to_string(),
+                })
+        }));
 
         let android = plan(
             &items,
             &PlannerSettings {
-                live_style: "androidMotionPhoto".to_string(),
+                live_style: LivePhotoStyle::AndroidMotionPhoto,
                 ..common
             },
         );
         assert_eq!(android.len(), 1);
-        assert!(android[0]
-            .tags
-            .iter()
-            .any(|tag| { tag == "LivePhotoAndroid:takeback-live-id:sample/live.mov" }));
+        assert_eq!(
+            android[0].live_action,
+            Some(LiveAction::AndroidMotionPhoto {
+                content_identifier: "takeback-live-id".to_string(),
+                video_source: "sample/live.mov".to_string(),
+            })
+        );
     }
 
     #[test]

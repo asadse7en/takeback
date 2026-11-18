@@ -94,6 +94,7 @@ mod tests {
                     .into(),
                 kind: PlacementKind::Original,
                 tags: Vec::new(),
+                live_action: None,
             },
             Placement {
                 src: "source/photo.jpg".to_string(),
@@ -104,6 +105,7 @@ mod tests {
                     .into(),
                 kind: PlacementKind::Link,
                 tags: vec!["Link".to_string()],
+                live_action: None,
             },
         ];
 

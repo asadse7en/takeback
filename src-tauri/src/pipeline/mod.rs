@@ -98,6 +98,7 @@ mod tests {
             dest: format!("out/{source}.jpg"),
             kind,
             tags: Vec::new(),
+            live_action: None,
         }
     }
 }

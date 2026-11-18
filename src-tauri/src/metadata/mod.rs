@@ -195,17 +195,33 @@ pub fn supports_embedded_metadata(path: &Path) -> bool {
     )
 }
 
-pub const EXIFTOOL_VIDEO_MAX_BYTES: u64 = 500 * 1024 * 1024;
+pub const EXIFTOOL_VIDEO_MAX_BYTES: u64 = 500_000_000;
 pub const EXIFTOOL_BATCH_SIZE: usize = 25;
 
-pub fn is_large_metadata_video(path: &Path, size_bytes: u64) -> bool {
+pub fn is_large_video(path: &Path, size_bytes: u64) -> bool {
     size_bytes > EXIFTOOL_VIDEO_MAX_BYTES
         && matches!(
             path.extension()
                 .and_then(|extension| extension.to_str())
                 .map(str::to_ascii_lowercase)
                 .as_deref(),
-            Some("mp4" | "mov" | "m4v" | "mpeg" | "3g2" | "mp")
+            Some(
+                "mp4"
+                    | "mov"
+                    | "m4v"
+                    | "avi"
+                    | "mkv"
+                    | "3gp"
+                    | "mts"
+                    | "m2ts"
+                    | "webm"
+                    | "mpg"
+                    | "mpeg"
+                    | "wmv"
+                    | "flv"
+                    | "3g2"
+                    | "mp"
+            )
         )
 }
 
@@ -314,10 +330,18 @@ impl ExifTool {
             write_descriptions,
             rate_favorites,
         };
-        self.write_batch(std::slice::from_ref(&request))?
+        let warnings = self
+            .write_batch(std::slice::from_ref(&request))?
             .into_iter()
             .next()
-            .ok_or_else(|| "ExifTool did not return a metadata result".to_string())
+            .ok_or_else(|| "ExifTool did not return a metadata result".to_string())?;
+        if let Some(error) = warnings
+            .iter()
+            .find(|warning| is_exiftool_failure_warning(warning))
+        {
+            return Err(error.clone());
+        }
+        Ok(warnings)
     }
 
     pub fn write_batch(
@@ -325,14 +349,13 @@ impl ExifTool {
         requests: &[MetadataWriteRequest],
     ) -> Result<Vec<Vec<String>>, String> {
         let mut warnings = vec![Vec::new(); requests.len()];
-        for batch_start in (0..requests.len()).step_by(EXIFTOOL_BATCH_SIZE) {
-            let batch_end = (batch_start + EXIFTOOL_BATCH_SIZE).min(requests.len());
+        for batch in metadata_batch_ranges(requests.len()) {
             let mut objects = Vec::new();
             let mut object_indices = Vec::new();
 
-            for index in batch_start..batch_end {
+            for index in batch {
                 let request = &requests[index];
-                if is_large_metadata_video(
+                if is_large_video(
                     &request.path,
                     fs::metadata(&request.path)
                         .map_err(|error| {
@@ -848,6 +871,18 @@ fn tool_warnings(output: &str) -> Vec<String> {
         .collect()
 }
 
+fn metadata_batch_ranges(request_count: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    (0..request_count)
+        .step_by(EXIFTOOL_BATCH_SIZE)
+        .map(move |start| start..(start + EXIFTOOL_BATCH_SIZE).min(request_count))
+}
+
+fn is_exiftool_failure_warning(warning: &str) -> bool {
+    let lowercase = warning.to_ascii_lowercase();
+    warning.trim_start().starts_with("Error:")
+        || (lowercase.contains("files weren") && lowercase.contains("updated"))
+}
+
 fn distribute_batch_warnings(
     diagnostics: &[String],
     object_indices: &[usize],
@@ -1056,18 +1091,30 @@ mod tests {
 
     #[test]
     fn large_video_metadata_is_skipped_above_the_limit_only() {
-        assert!(!is_large_metadata_video(
+        assert!(!is_large_video(
             Path::new("clip.mp4"),
             EXIFTOOL_VIDEO_MAX_BYTES
         ));
-        assert!(is_large_metadata_video(
+        assert!(is_large_video(
             Path::new("clip.mp4"),
             EXIFTOOL_VIDEO_MAX_BYTES + 1
         ));
-        assert!(!is_large_metadata_video(
+        assert!(is_large_video(
+            Path::new("clip.webm"),
+            EXIFTOOL_VIDEO_MAX_BYTES + 1
+        ));
+        assert!(!is_large_video(
             Path::new("photo.jpg"),
             EXIFTOOL_VIDEO_MAX_BYTES + 1
         ));
+    }
+
+    #[test]
+    fn metadata_batches_contain_at_most_twenty_five_requests() {
+        let batch_lengths = metadata_batch_ranges(51)
+            .map(|range| range.len())
+            .collect::<Vec<_>>();
+        assert_eq!(batch_lengths, [25, 25, 1]);
     }
 
     #[test]

@@ -1971,6 +1971,7 @@ mod tests {
             dest: "C:\\output\\photo.jpg".to_string(),
             kind: crate::planner::PlacementKind::Original,
             tags: Vec::new(),
+            live_action: None,
         };
         let entry = crate::archive::IndexedEntry {
             archive_path: archive.clone(),

@@ -764,10 +764,31 @@ impl TempIndex {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(|e| format!("count indexed entries: {e}"))?;
+        let candidates = self
+            .media_entries()?
+            .into_iter()
+            .filter(|entry| matches!(entry.entry_type, EntryType::Photo | EntryType::Video))
+            .map(|entry| matcher::LivePhotoCandidate {
+                path: format!("{}::{}", entry.archive_path, entry.path),
+                kind: if entry.entry_type == EntryType::Photo {
+                    matcher::LiveMediaKind::Photo
+                } else {
+                    matcher::LiveMediaKind::Video
+                },
+                taken_timestamp: entry
+                    .metadata
+                    .as_ref()
+                    .and_then(crate::metadata::TakeoutMetadata::taken_timestamp),
+                duration_seconds: entry.video_duration_seconds,
+                embedded_motion_marker: entry.embedded_motion_video,
+            })
+            .collect::<Vec<_>>();
+        let live_detection = matcher::match_live_photos(&candidates);
+        let live = live_detection.pairs.len() + live_detection.embedded_motion_photos.len();
         Ok(Counts {
             photos: stats.0,
             videos: stats.1,
-            live: 0,
+            live: u32::try_from(live).map_err(|e| format!("live photo count exceeds u32: {e}"))?,
             total_gb: stats.2,
         })
     }
@@ -1562,6 +1583,33 @@ mod tests {
                 .unwrap();
         }
         archive.finish().unwrap();
+    }
+
+    #[test]
+    fn counts_detect_live_pairs_and_embedded_motion_photos() {
+        let index = TempIndex::new().unwrap();
+        let insert = |path: &str, kind: &str, embedded_motion_video: bool| {
+            index
+                .conn
+                .execute(
+                    "INSERT INTO entries (
+                        archive_path, path, entry_path, size, kind, album, trashed, archived,
+                        embedded_motion_video, video_duration_seconds, metadata_json,
+                        sidecar_archive_path, sidecar_path, sidecar_match
+                    ) VALUES (?1, ?2, ?2, 1, ?3, NULL, 0, 0, ?4, NULL, NULL, NULL, NULL, NULL)",
+                    rusqlite::params!["takeout.zip", path, kind, embedded_motion_video],
+                )
+                .unwrap();
+        };
+        insert("Photos/Album/IMG_0001.jpg", "photo", false);
+        insert("Photos/Album/IMG_0001.mov", "video", false);
+        insert("Photos/Album/IMG_0002.MP.jpg", "photo", true);
+
+        let counts = index.counts().unwrap();
+
+        assert_eq!(counts.photos, 2);
+        assert_eq!(counts.videos, 1);
+        assert_eq!(counts.live, 2);
     }
 
     #[test]

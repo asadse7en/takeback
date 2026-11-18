@@ -315,6 +315,19 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn disk_matching_removes_windows_extended_path_prefixes() {
+        assert_eq!(
+            path_for_disk_matching(Path::new(r"\\?\C:\Photos")),
+            PathBuf::from(r"C:\Photos")
+        );
+        assert_eq!(
+            path_for_disk_matching(Path::new(r"\\?\UNC\server\share\Photos")),
+            PathBuf::from(r"\\server\share\Photos")
+        );
+    }
+
     #[test]
     fn output_root_uses_new_or_empty_folder_directly() {
         let temp = tempdir().expect("create test directory");
