@@ -1,262 +1,221 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Database, Disc3, FileText, Image, Upload, Video, X } from 'lucide-react';
-import { Channel } from '@tauri-apps/api/core';
+import {
+  AlertTriangle, CheckCircle2, Database, Disc3, FileText, Image, Upload, Video, X,
+} from 'lucide-react';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open } from '@tauri-apps/plugin-dialog';
-import { Button, PageFrame, PageHeading, Panel, StatusCheck } from '@/components/Ui';
-import { callCommand, type ScanProgress, type ScanSourcesResult, type SourceRecord } from '@/lib/api';
-import { useScanStore } from '@/store/scan';
+import { Button, PageFrame, PageHeading } from '@/components/Ui';
+import { useAddStore } from '@/store/add';
+import type { TakeoutFile } from '@/services/addIndexing';
 
-function startScan(paths: string[], onProgress: (progress: ScanProgress) => void) {
-  const channel = new Channel<ScanProgress>();
-  return new Promise<ScanSourcesResult>((resolve, reject) => {
-    let settled = false;
-    channel.onmessage = (progress) => {
-      if (settled) return;
-      onProgress(progress);
-      if (progress.stage === 'done') {
-        settled = true;
-        if (progress.result) resolve(progress.result);
-        else reject(new Error('Scan completed without a result.'));
-      } else if (progress.stage === 'error') {
-        settled = true;
-        reject(new Error(progress.error || 'Could not scan Takeout sources.'));
-      } else if (progress.stage === 'cancelled') {
-        settled = true;
-        reject(new Error('Scan cancelled.'));
-      }
-    };
-    void callCommand('start_scan', { paths, onEvent: channel }).catch((reason: unknown) => {
-      if (settled) return;
-      settled = true;
-      reject(reason);
-    });
-  });
-}
-
-function formatBytes(bytes: number) {
-  if (bytes < 1_000_000_000) return `${(bytes / 1_000_000).toFixed(1)} MB`;
+function formatSize(bytes: number) {
   return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
 }
 
-function scanErrorMessage(reason: unknown) {
-  return reason instanceof Error ? reason.message : String(reason);
+function progressPercent(file: TakeoutFile) {
+  return file.itemsTotal ? Math.min(100, Math.floor((file.itemsRead / file.itemsTotal) * 100)) : 0;
 }
+
+function indexedCount(files: TakeoutFile[]) {
+  return files.filter((file) => file.status === 'indexed').length;
+}
+
+function footerMessage(files: TakeoutFile[]) {
+  const indexed = indexedCount(files);
+  const failed = files.filter((file) => file.status === 'failed').length;
+  if (failed > 0) return `${indexed} of ${files.length} files indexed. ${failed} couldn't be read.`;
+  const allFinished = files.every((file) => file.status === 'indexed' || file.status === 'failed');
+  if (allFinished) return `${indexed} of ${files.length} files indexed.`;
+  return `${indexed} of ${files.length} files indexed. You can continue while the rest finish.`;
+}
+
+function stateLabel(file: TakeoutFile) {
+  if (file.status === 'indexed') return (
+    <span className="add-file__status add-file__status--indexed">
+      <CheckCircle2 size={16} aria-hidden="true" />Indexed
+    </span>
+  );
+  if (file.status === 'indexing') return (
+    <span className="add-file__status add-file__status--indexing">
+      <span className="add-file__spinner" aria-hidden="true" />
+      Indexing {progressPercent(file)}%
+    </span>
+  );
+  if (file.status === 'failed') return null;
+  return <span className="add-file__status add-file__status--waiting">Waiting</span>;
+}
+
+const FileRow = memo(function FileRow({ file }: { file: TakeoutFile }) {
+  const removeFile = useAddStore((state) => state.removeFile);
+  const retryFile = useAddStore((state) => state.retryFile);
+  const percent = progressPercent(file);
+
+  return (
+    <div className={`add-file-row add-file-row--${file.status}`} role="listitem">
+      {file.status === 'failed' ? (
+        <AlertTriangle className="add-file__icon add-file__icon--warning" size={20} strokeWidth={1.5} aria-hidden="true" />
+      ) : (
+        <FileText
+          className={`add-file__icon${file.status === 'indexing' ? ' add-file__icon--indexing' : ''}`}
+          size={20}
+          strokeWidth={1.5}
+          aria-hidden="true"
+        />
+      )}
+      <div className="add-file__details">
+        <span className="add-file__name" title={file.name}>{file.name}</span>
+        {file.status === 'indexing' ? (
+          <>
+            <div
+              className="add-file__progress"
+              role="progressbar"
+              aria-label={`Indexing ${file.name}`}
+              aria-valuenow={percent}
+              aria-valuemin={0}
+              aria-valuemax={100}
+            >
+              <span style={{ width: `${percent}%` }} />
+            </div>
+            <span className="add-file__detail">
+              Reading {file.itemsRead.toLocaleString()} of {file.itemsTotal.toLocaleString()} items · {file.currentPath}
+            </span>
+          </>
+        ) : null}
+        {file.status === 'failed' ? (
+          <span className="add-file__detail add-file__detail--error">
+            {file.error || "Couldn't finish reading this file. It may be incomplete, so download it again."}
+          </span>
+        ) : null}
+      </div>
+      <span className="add-file__size">{formatSize(file.sizeBytes)}</span>
+      <span className="add-file__status-cell">
+        {file.status === 'failed' ? (
+          <Button className="add-file__retry" onClick={() => retryFile(file.id)}>Retry</Button>
+        ) : stateLabel(file)}
+      </span>
+      <button
+        className="icon-button add-file__remove"
+        type="button"
+        aria-label={`${file.status === 'indexing' ? 'Cancel indexing' : 'Remove'} ${file.name}`}
+        onClick={() => removeFile(file.id)}
+      >
+        <X size={14} aria-hidden="true" />
+      </button>
+    </div>
+  );
+});
 
 export default function AddPage() {
   const navigate = useNavigate();
-  const [scanning, setScanning] = useState(false);
-  const [pendingSourceIds, setPendingSourceIds] = useState<string[]>([]);
-  const [error, setError] = useState('');
-  const [warnings, setWarnings] = useState<string[]>([]);
-  const [progress, setProgress] = useState<ScanProgress | null>(null);
-  const pendingIds = useRef(new Set<string>());
-  const scanLoopRunning = useRef(false);
-  const archives = useScanStore((state) => state.scan.sources);
-  const scan = useScanStore((state) => state.scan);
-  const setFiles = useScanStore((state) => state.setFiles);
-  const setSources = useScanStore((state) => state.setSources);
-  const setCounts = useScanStore((state) => state.setCounts);
+  const files = useAddStore((state) => state.files);
+  const stats = useAddStore((state) => state.stats);
+  const hasStartedIndexing = useAddStore((state) => state.hasStartedIndexing);
+  const announcement = useAddStore((state) => state.announcement);
+  const notice = useAddStore((state) => state.notice);
+  const dragging = useAddStore((state) => state.dragging);
+  const addFiles = useAddStore((state) => state.addFiles);
+  const setDragging = useAddStore((state) => state.setDragging);
+  const showNotice = useAddStore((state) => state.showNotice);
+  const readyCount = indexedCount(files);
 
-  const updatePendingIds = useCallback((next: Set<string>) => {
-    pendingIds.current = next;
-    setPendingSourceIds(Array.from(next));
-  }, []);
-
-  const runScanQueue = useCallback(async () => {
-    if (scanLoopRunning.current || pendingIds.current.size === 0) return;
-    scanLoopRunning.current = true;
-    setScanning(true);
-    setError('');
-    let completed = false;
-    try {
-      while (pendingIds.current.size > 0) {
-        const batchIds = new Set(pendingIds.current);
-        const sources = useScanStore.getState().scan.sources;
-        const paths = sources.filter((source) => batchIds.has(source.id)).map((source) => source.path);
-        if (paths.length === 0) {
-          updatePendingIds(new Set(Array.from(pendingIds.current).filter((id) => !batchIds.has(id))));
-          continue;
-        }
-
-        const result = await startScan(paths, setProgress);
-        setFiles(result.files);
-        setCounts(result.counts);
-        setWarnings(result.warnings);
-        updatePendingIds(new Set(Array.from(pendingIds.current).filter((id) => !batchIds.has(id))));
-      }
-      completed = true;
-    } catch (reason) {
-      if (scanErrorMessage(reason) === 'Scan cancelled.') {
-        setWarnings(['Scan cancelled. Added files are still available to index.']);
-      } else {
-        setError(scanErrorMessage(reason));
-      }
-    } finally {
-      scanLoopRunning.current = false;
-      setScanning(false);
-      setProgress(null);
-      if (completed && pendingIds.current.size > 0) void runScanQueue();
-    }
-  }, [setCounts, setFiles, updatePendingIds]);
-
-  const addFiles = useCallback(async (paths: string[]) => {
-    if (!paths.length) return;
-    setError('');
-    try {
-      const result = await callCommand('add_sources', { paths });
-      const currentSources = useScanStore.getState().scan.sources;
-      const currentIds = new Set(currentSources.map((source) => source.id));
-      const newSources = result.archives.filter((source) => !currentIds.has(source.id));
-      const updated = [...new Map([...currentSources, ...result.archives].map((archive) => [archive.id, archive])).values()];
-      setSources(updated);
-      setWarnings(result.warnings);
-      if (newSources.length > 0) {
-        updatePendingIds(new Set([
-          ...pendingIds.current,
-          ...newSources.map((source) => source.id),
-        ]));
-        void runScanQueue();
-      }
-    } catch (reason) {
-      setError(scanErrorMessage(reason));
-    }
-  }, [runScanQueue, setSources, updatePendingIds]);
+  const handleDrop = useCallback((paths: string[]) => {
+    addFiles(paths);
+  }, [addFiles]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let disposed = false;
     void getCurrentWebview().onDragDropEvent((event) => {
-      if (event.payload.type === 'drop') void addFiles(event.payload.paths);
+      if (event.payload.type === 'enter' || event.payload.type === 'over') {
+        setDragging(true);
+      } else if (event.payload.type === 'leave') {
+        setDragging(false);
+      } else if (event.payload.type === 'drop') {
+        setDragging(false);
+        handleDrop(event.payload.paths);
+      }
     }).then((stopListening) => {
       if (disposed) stopListening();
       else unlisten = stopListening;
     }).catch((reason: unknown) => {
-      setError(scanErrorMessage(reason));
+      showNotice(`Could not listen for dropped files: ${reason instanceof Error ? reason.message : String(reason)}`);
     });
     return () => {
       disposed = true;
+      setDragging(false);
       unlisten?.();
     };
-  }, [addFiles]);
+  }, [handleDrop, setDragging, showNotice]);
 
   const browse = async () => {
-    const selected = await open({
-      multiple: true,
-      filters: [{ name: 'Takeout archives', extensions: ['zip', 'tgz', 'gz'] }],
-    });
-    const paths = selected ? (Array.isArray(selected) ? selected : [selected]) : [];
-    await addFiles(paths);
-  };
-
-  const addFolder = async () => {
-    const selected = await open({ directory: true });
-    const paths = selected ? (Array.isArray(selected) ? selected : [selected]) : [];
-    await addFiles(paths);
-  };
-
-  const cancelScan = async () => {
     try {
-      await callCommand('cancel_scan', {});
+      const selected = await open({
+        multiple: true,
+        filters: [{ name: 'Takeout archives', extensions: ['zip', 'tgz', 'gz'] }],
+      });
+      if (selected) addFiles(Array.isArray(selected) ? selected : [selected]);
     } catch (reason) {
-      setError(scanErrorMessage(reason));
+      showNotice(`Could not open files: ${reason instanceof Error ? reason.message : String(reason)}`);
     }
   };
 
-  const remove = async (archive: SourceRecord) => {
-    setError('');
-    try {
-      const result = await callCommand('remove_source', { sourceId: archive.id });
-      const updated = archives.filter((item) => item.id !== archive.id);
-      setSources(updated);
-      setFiles(result.files);
-      setCounts(result.counts);
-      setWarnings(result.warnings);
-      updatePendingIds(new Set(Array.from(pendingIds.current).filter((id) => id !== archive.id)));
-    } catch (reason) {
-      setError(scanErrorMessage(reason));
-    }
-  };
-
-  const stats = [
-    { label: 'Photos', value: scan.counts.photos.toLocaleString(), Icon: Image },
-    { label: 'Videos', value: scan.counts.videos.toLocaleString(), Icon: Video },
-    { label: 'Live photos', value: scan.counts.live.toLocaleString(), Icon: Disc3 },
-    { label: 'Total', value: `${scan.counts.totalGb.toFixed(1)} GB`, Icon: Database },
+  const statItems = [
+    { label: 'Photos', value: stats.photos.toLocaleString(), Icon: Image },
+    { label: 'Videos', value: stats.videos.toLocaleString(), Icon: Video },
+    { label: 'Live photos', value: stats.livePhotos.toLocaleString(), Icon: Disc3 },
+    { label: 'Read so far', value: formatSize(stats.bytesRead), Icon: Database },
   ];
 
   return (
     <PageFrame
+      className="add-page-frame"
       title="Add your Takeout files"
       subtitle="Add every zip from your Google Photos export."
-      footer={<><span /><Button variant="accent" disabled={!archives.length || scanning || pendingSourceIds.length > 0} onClick={() => navigate('/preferences')}>Next</Button></>}
+      footer={
+        <>
+          <span className="add-footer__message">{footerMessage(files)}</span>
+          <Button variant="accent" disabled={readyCount === 0} onClick={() => navigate('/preferences')}>Next</Button>
+        </>
+      }
     >
-      <div className="add-sources">
-        <button className="drop-zone" type="button" aria-label="Browse for Takeout files" onClick={() => void browse()}>
-          <Upload size={30} strokeWidth={1.5} aria-hidden="true" />
-          <strong>Drop your Takeout here</strong>
+      <div className="add-page-body">
+        <button
+          className={`drop-zone${files.length ? ' drop-zone--compact' : ''}${dragging ? ' drop-zone--dragging' : ''}`}
+          type="button"
+          aria-label="Browse for Takeout files"
+          onClick={() => void browse()}
+        >
+          <Upload size={28} strokeWidth={1.5} aria-hidden="true" />
+          <strong>{dragging ? 'Release to add' : 'Drop your Takeout here'}</strong>
           <span className="drop-zone__button">Browse</span>
         </button>
-        <Button className="add-folder-button" onClick={() => void addFolder()}>Add folder</Button>
-      </div>
+        {notice ? <p className="add-notice">{notice}</p> : null}
 
-      {scanning ? (
-        <div className="scan-progress" role="status">
-          <div className="scan-progress__summary">
-            <span>{progress?.currentArchive.split(/[\\/]/).pop() || 'Preparing to index added files'}</span>
-            <span>{progress ? `${progress.entriesSeen.toLocaleString()} entries indexed` : 'Starting scan'}</span>
-          </div>
-          <div className="scan-progress__track" role="progressbar" aria-label="Indexing Takeout files">
-            <span />
-          </div>
-          <Button onClick={() => void cancelScan()}>Cancel</Button>
+        <PageHeading>Added files ({files.length})</PageHeading>
+        <div className={`add-file-list${files.length ? '' : ' add-file-list--empty'}`} role="list" aria-label="Added files">
+          {files.map((file) => <FileRow file={file} key={file.id} />)}
         </div>
-      ) : null}
 
-      <PageHeading>Added files ({archives.length})</PageHeading>
-      <Panel className="archive-list">
-        {archives.map((archive) => {
-          const isPending = pendingSourceIds.includes(archive.id);
-          return (
-            <div className="archive-row" key={archive.id}>
-              <FileText className="archive-row__file" size={20} strokeWidth={1.5} aria-hidden="true" />
-              <span className="archive-row__name">{archive.path.split(/[\\/]/).pop() || archive.path}</span>
-              <span className="archive-row__size">{formatBytes(archive.sizeBytes)}</span>
-              {isPending ? (
-                <span className="archive-row__pending">Added, indexing in background</span>
-              ) : (
-                <StatusCheck>
-                  {archive.entryCountKnown
-                    ? `${archive.entryCount.toLocaleString()} entries`
-                    : 'Entry count unknown'}
-                </StatusCheck>
-              )}
-              <button type="button" className="icon-button" aria-label={`Remove ${archive.path}`} onClick={() => void remove(archive)} disabled={scanning}>
-                <X size={15} aria-hidden="true" />
-              </button>
-            </div>
-          );
-        })}
-        {error ? <p role="alert" className="form-error">{error}</p> : null}
-        {warnings.length ? <p className="info-message" role="status">{warnings.join(' ')}</p> : null}
-        {pendingSourceIds.length > 0 && !scanning ? (
-          <div className="scan-retry">
-            <span>Some files still need indexing.</span>
-            <Button onClick={() => void runScanQueue()}>Retry indexing</Button>
-          </div>
+        {hasStartedIndexing && files.length > 0 ? (
+          <>
+            <PageHeading>Found so far</PageHeading>
+            <section className="found-stats panel" aria-label="Indexing totals">
+              {statItems.map(({ label, value, Icon }, index) => (
+                <div className="found-stat" key={label}>
+                  {index > 0 ? <span className="found-stat__divider" aria-hidden="true" /> : null}
+                  <span className="found-stat__icon"><Icon size={20} strokeWidth={1.5} aria-hidden="true" /></span>
+                  <span className="found-stat__copy">
+                    <strong>{value}</strong>
+                    <small>{label}</small>
+                  </span>
+                </div>
+              ))}
+            </section>
+          </>
         ) : null}
-      </Panel>
-
-      <Panel className="archive-stats">
-        {stats.map(({ label, value, Icon }, index) => (
-          <div className="archive-stat" key={label}>
-            {index > 0 ? <span className="archive-stat__divider" aria-hidden="true" /> : null}
-            <span className="archive-stat__icon"><Icon size={20} strokeWidth={1.5} aria-hidden="true" /></span>
-            <span><strong>{value}</strong><small>{label}</small></span>
-          </div>
-        ))}
-      </Panel>
+      </div>
+      <span className="visually-hidden" aria-live="polite" aria-atomic="true">{announcement}</span>
     </PageFrame>
   );
 }

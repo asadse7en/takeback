@@ -8,8 +8,6 @@ const initialRunState: RunState = {
   percent: 0,
   status: 'Ready',
   currentFile: '',
-  speedSamples: [],
-  recentFiles: [],
   warnings: [],
   lastEventAt: null,
   processedBytes: 0,
@@ -23,6 +21,7 @@ type RunStore = {
   run: RunState;
   claimed: boolean;
   setProgress: (progress: ProcessingProgress) => void;
+  setCounts: (completed: number, total: number) => void;
   setStatus: (status: string) => void;
   claimStart: () => boolean;
   reset: () => void;
@@ -32,30 +31,32 @@ export const useRunStore = create<RunStore>((set) => ({
   run: initialRunState,
   claimed: false,
   setProgress: (progress) =>
-    set((state) => {
-      const currentFile = progress.currentFile ?? state.run.currentFile;
-      const recentFiles = progress.currentFile
-        ? [progress.currentFile, ...state.run.recentFiles.filter((file) => file !== progress.currentFile)].slice(0, 5)
-        : state.run.recentFiles;
-      return {
-        run: {
-          ...state.run,
-          completed: progress.completedFiles,
-          total: progress.totalFiles,
-          percent: progress.totalFiles ? Math.round((progress.completedFiles / progress.totalFiles) * 100) : 0,
-          status: 'Running',
-          currentFile,
-          recentFiles,
-          warnings: progress.warnings,
-          processedBytes: progress.processedBytes,
-          totalBytes: progress.totalBytes,
-          bytesPerSecond: progress.bytesPerSecond,
-          etaSeconds: progress.etaSeconds,
-          warningsCount: progress.warningsCount,
-          lastEventAt: Date.now(),
-        },
-      };
-    }),
+    set((state) => ({
+      run: {
+        ...state.run,
+        completed: progress.completedFiles,
+        total: progress.totalFiles,
+        percent: progress.totalFiles ? Math.round((progress.completedFiles / progress.totalFiles) * 100) : 0,
+        status: 'Running',
+        currentFile: progress.currentFile ?? state.run.currentFile,
+        warnings: progress.warnings,
+        processedBytes: progress.processedBytes,
+        totalBytes: progress.totalBytes,
+        bytesPerSecond: progress.bytesPerSecond,
+        etaSeconds: progress.etaSeconds,
+        warningsCount: progress.warningsCount,
+        lastEventAt: Date.now(),
+      },
+    })),
+  setCounts: (completed, total) =>
+    set((state) => ({
+      run: {
+        ...state.run,
+        completed,
+        total,
+        percent: total ? Math.round((completed / total) * 100) : 0,
+      },
+    })),
   setStatus: (status) => set((state) => ({ run: { ...state.run, status } })),
   claimStart: () => {
     let claimed = false;

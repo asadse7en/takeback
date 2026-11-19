@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Archive, CalendarDays, Check, Copy, FileText, Folder, FolderOpen,
@@ -64,7 +64,6 @@ export default function PreferencesPage() {
   const navigate = useNavigate();
   const settings = useSettingsStore((state) => state.settings);
   const updateSettings = useSettingsStore((state) => state.updateSettings);
-  const replaceSettings = useSettingsStore((state) => state.replaceSettings);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [deleteConfirmation, setDeleteConfirmation] = useState('');
@@ -73,34 +72,30 @@ export default function PreferencesPage() {
     files: [], tree: [], warnings: [], requiredBytes: 0, freeBytes: 0,
   });
   const [error, setError] = useState('');
+  const previewRequestId = useRef(0);
   const previewTree = useMemo(() => flattenTree(preview.tree), [preview.tree]);
   const outputName = preview.tree[0]?.name ?? 'Photo Library';
   const freeAfter = Math.max(0, preview.freeBytes - preview.requiredBytes);
 
   useEffect(() => {
-    let active = true;
-    callCommand('load_settings', {}).then((loaded) => {
-      if (active) replaceSettings(loaded);
-    }).catch((reason: unknown) => {
-      if (active) setError(reason instanceof Error ? reason.message : String(reason));
-    });
-    return () => { active = false; };
-  }, [replaceSettings]);
-
-  useEffect(() => {
-    let active = true;
+    if (!settings) return;
+    const requestId = ++previewRequestId.current;
     const timer = window.setTimeout(() => {
       callCommand('get_preview', { settings }).then((result) => {
-        if (active) setPreview(result);
+        if (previewRequestId.current === requestId) setPreview(result);
       }).catch((reason: unknown) => {
-        if (active) setError(reason instanceof Error ? reason.message : String(reason));
+        if (previewRequestId.current === requestId) {
+          setError(reason instanceof Error ? reason.message : String(reason));
+        }
       });
     }, 120);
     return () => {
-      active = false;
       window.clearTimeout(timer);
+      if (previewRequestId.current === requestId) previewRequestId.current += 1;
     };
   }, [settings]);
+
+  if (!settings) return null;
 
   const updateFolder = (key: 'albumMode' | 'favoritesMode' | 'editedMode', label: string) => {
     if (label in folderModes) updateSettings({ [key]: folderModes[label as FolderLabel] });
@@ -110,6 +105,7 @@ export default function PreferencesPage() {
     if (typeof selected === 'string') updateSettings({ outputFolder: selected });
   };
   const start = async () => {
+    if (!settings) return;
     setError('');
     try {
       await callCommand('save_settings', { settings });

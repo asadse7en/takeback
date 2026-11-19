@@ -41,8 +41,6 @@ export type RunState = {
   percent: number;
   status: string;
   currentFile: string;
-  speedSamples: number[];
-  recentFiles: string[];
   warnings: string[];
   lastEventAt: number | null;
   processedBytes: number;
