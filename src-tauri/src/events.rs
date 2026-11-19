@@ -9,6 +9,9 @@ pub const PROCESSING_PROGRESS_EVENT: &str = "processing:progress";
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessingProgressEvent {
+    pub stage: Option<String>,
+    pub items_done: Option<u64>,
+    pub items_total: Option<u64>,
     pub current_file: Option<String>,
     pub completed_files: u64,
     pub total_files: u64,
@@ -73,8 +76,11 @@ mod tests {
         let value = serde_json::to_value(ProcessingProgressEvent::default())
             .expect("serialize progress event");
 
+        assert!(value.get("itemsDone").is_some());
+        assert!(value.get("itemsTotal").is_some());
         assert!(value.get("currentFile").is_some());
         assert!(value.get("completedFiles").is_some());
+        assert!(value.get("stage").is_some());
         assert!(value.get("processedBytes").is_some());
         assert!(value.get("bytesPerSecond").is_some());
         assert!(value.get("etaSeconds").is_some());

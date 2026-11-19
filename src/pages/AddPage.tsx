@@ -14,7 +14,9 @@ function formatSize(bytes: number) {
 }
 
 function progressPercent(file: TakeoutFile) {
-  return file.itemsTotal ? Math.min(100, Math.floor((file.itemsRead / file.itemsTotal) * 100)) : 0;
+  return file.itemsTotalKnown && file.itemsTotal
+    ? Math.min(100, Math.floor((file.itemsRead / file.itemsTotal) * 100))
+    : 0;
 }
 
 function indexedCount(files: TakeoutFile[]) {
@@ -39,7 +41,7 @@ function stateLabel(file: TakeoutFile) {
   if (file.status === 'indexing') return (
     <span className="add-file__status add-file__status--indexing">
       <span className="add-file__spinner" aria-hidden="true" />
-      Indexing {progressPercent(file)}%
+      Indexing{file.itemsTotalKnown ? ` ${progressPercent(file)}%` : ''}
     </span>
   );
   if (file.status === 'failed') return null;
@@ -68,17 +70,19 @@ const FileRow = memo(function FileRow({ file }: { file: TakeoutFile }) {
         {file.status === 'indexing' ? (
           <>
             <div
-              className="add-file__progress"
+              className={`add-file__progress${file.itemsTotalKnown ? '' : ' add-file__progress--indeterminate'}`}
               role="progressbar"
               aria-label={`Indexing ${file.name}`}
-              aria-valuenow={percent}
+              aria-valuenow={file.itemsTotalKnown ? percent : undefined}
               aria-valuemin={0}
               aria-valuemax={100}
             >
-              <span style={{ width: `${percent}%` }} />
+              <span style={file.itemsTotalKnown ? { width: `${percent}%` } : undefined} />
             </div>
             <span className="add-file__detail">
-              Reading {file.itemsRead.toLocaleString()} of {file.itemsTotal.toLocaleString()} items · {file.currentPath}
+              Reading {file.itemsRead.toLocaleString()}
+              {file.itemsTotalKnown ? ` of ${file.itemsTotal.toLocaleString()}` : ''} items
+              {file.currentPath ? ` · ${file.currentPath}` : ''}
             </span>
           </>
         ) : null}

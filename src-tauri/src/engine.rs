@@ -437,6 +437,7 @@ pub fn start_indexed_run_with_manifest(
     archives_to_delete: HashSet<String>,
     exiftool_path: &Path,
     manifest: RunManifest,
+    preparation_cancel: &AtomicBool,
 ) -> Result<RunSummary, String> {
     start_indexed_run_inner(
         settings,
@@ -446,6 +447,7 @@ pub fn start_indexed_run_with_manifest(
         archives_to_delete,
         exiftool_path,
         Some(manifest),
+        Some(preparation_cancel),
         &send_archive_to_trash,
         |progress| {
             crate::events::emit_processing_progress(app, progress)
@@ -471,6 +473,7 @@ pub fn start_indexed_run_with_progress(
         archives_to_delete,
         exiftool_path,
         None,
+        None,
         &send_archive_to_trash,
         emit_progress,
     )
@@ -495,6 +498,7 @@ pub(crate) fn start_indexed_run_with_progress_and_deleter(
         archives_to_delete,
         exiftool_path,
         None,
+        None,
         &send_to_trash,
         emit_progress,
     )
@@ -508,14 +512,19 @@ fn start_indexed_run_inner(
     archives_to_delete: HashSet<String>,
     exiftool_path: &Path,
     mut manifest: Option<RunManifest>,
+    preparation_cancel: Option<&AtomicBool>,
     send_to_trash: &dyn Fn(&Path) -> Result<(), String>,
     mut emit_progress: impl FnMut(&crate::events::ProcessingProgressEvent) -> Result<(), String>,
 ) -> Result<RunSummary, String> {
     let control = run_control();
-    control
+    let initial_control = control
         .lock()
-        .map_err(|error| format!("run control is unavailable: {error}"))?
-        .reset();
+        .map_err(|error| format!("run control is unavailable: {error}"))?;
+    initial_control.reset();
+    if preparation_cancel.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+        initial_control.cancel();
+    }
+    drop(initial_control);
 
     let mut tasks_by_source = HashMap::<String, usize>::new();
     let mut tasks = Vec::<ProcessingTask>::new();
@@ -1339,6 +1348,9 @@ fn emit_indexed_progress(
         None
     };
     emit_progress(&crate::events::ProcessingProgressEvent {
+        stage: None,
+        items_done: None,
+        items_total: None,
         current_file: current_file.map(str::to_string),
         completed_files: completed_files.into(),
         total_files: total_files.into(),
@@ -2352,6 +2364,7 @@ mod tests {
             HashSet::new(),
             Path::new(""),
             Some(manifest),
+            None,
             &send_archive_to_trash,
             |_| Ok(()),
         )

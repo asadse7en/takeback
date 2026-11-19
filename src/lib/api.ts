@@ -90,6 +90,7 @@ export type ReportDocument = {
 
 export type ProcessingStartResult = {
   accepted: boolean;
+  cancelled: boolean;
   requiredBytes: number;
   freeBytes: number;
   shortfallBytes: number;
@@ -113,6 +114,9 @@ export type ReportExport = {
 };
 
 export type ProcessingProgress = {
+  stage: string | null;
+  itemsDone: number | null;
+  itemsTotal: number | null;
   currentFile: string | null;
   completedFiles: number;
   totalFiles: number;

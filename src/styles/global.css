@@ -480,6 +480,16 @@
   transition: width 100ms linear;
 }
 
+.add-file__progress--indeterminate span {
+  width: 35%;
+  animation: add-file-progress-slide 1.2s ease-in-out infinite alternate;
+}
+
+@keyframes add-file-progress-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(285%); }
+}
+
 .add-file__detail {
   display: block;
   overflow: hidden;
@@ -1136,6 +1146,44 @@
   outline-offset: 2px;
 }
 
+.progress-page-frame {
+  height: 100vh;
+  min-height: 0;
+}
+
+.progress-page-frame > .page-content {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.progress-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  border-color: #E5B47F;
+  background: #FFF6EC;
+  padding: 16px;
+}
+
+.progress-error__icon {
+  flex: none;
+  color: #B8530A;
+}
+
+.progress-error h2 {
+  margin: 0;
+  color: #693A12;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.progress-error p {
+  margin: 5px 0 0;
+  color: #724215;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .progress-card {
   display: flex;
   min-height: 180px;
@@ -1197,6 +1245,16 @@
   height: 100%;
   border-radius: inherit;
   background: linear-gradient(90deg, #FDC98F, #EE933A);
+}
+
+.progress-meter--indeterminate span {
+  width: 35%;
+  animation: progress-meter-slide 1.2s ease-in-out infinite alternate;
+}
+
+@keyframes progress-meter-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(285%); }
 }
 
 .progress-metrics {
@@ -1825,7 +1883,9 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .add-file__spinner {
+  .add-file__spinner,
+  .add-file__progress--indeterminate span,
+  .progress-meter--indeterminate span {
     animation: none;
   }
 }

@@ -9,6 +9,7 @@ import { useSettingsStore } from '@/store/settings';
 
 let startProcessingPromise: Promise<ProcessingStartResult> | null = null;
 let handledStartProcessingPromise: Promise<ProcessingStartResult> | null = null;
+let startProcessingOutcomeHandled = false;
 
 function formatEta(seconds: number | null) {
   if (seconds === null) return 'Calculating';
@@ -28,25 +29,34 @@ export default function ProgressPage() {
   const [error, setError] = useState('');
 
   useEffect(() => {
+    if (!startProcessingPromise) startProcessingOutcomeHandled = false;
     let active = true;
     let unlisten: (() => void) | undefined;
     let observedRunning = false;
     let completionHandled = false;
     let statusRequestPending = false;
+    let sawEngineProgress = false;
 
     const observeStartPromise = (promise: Promise<ProcessingStartResult>) => {
       if (handledStartProcessingPromise === promise) return;
       handledStartProcessingPromise = promise;
       void promise.then((result) => {
+        startProcessingOutcomeHandled = true;
+        if (result.cancelled) {
+          setStatus('Cancelled');
+          setError(result.warnings.join(' ') || 'Processing was cancelled before it started.');
+          return;
+        }
         if (!result.accepted) {
           setStatus('Blocked');
-          setError(result.warnings.join(' '));
+          setError(result.warnings.join(' ') || 'There is not enough free space to complete processing.');
           return;
         }
         setReport(result.report);
         setStatus(result.report?.summary.cancelled ? 'Cancelled' : 'Complete');
         navigate('/done');
       }).catch((reason: unknown) => {
+        startProcessingOutcomeHandled = true;
         setStatus('Failed');
         setError(reason instanceof Error ? reason.message : String(reason));
       }).finally(() => {
@@ -54,7 +64,10 @@ export default function ProgressPage() {
       });
     };
 
-    subscribeToEvent('processing:progress', setProgress).then((dispose) => {
+    subscribeToEvent('processing:progress', (progress) => {
+      if (!progress.stage) sawEngineProgress = true;
+      setProgress(progress);
+    }).then((dispose) => {
       if (active) unlisten = dispose;
       else dispose();
     }).catch((reason: unknown) => {
@@ -71,11 +84,17 @@ export default function ProgressPage() {
           observedRunning = true;
           setCounts(status.completed, status.total);
           setPaused(status.paused);
-          setStatus(status.paused ? 'Paused' : 'Running');
+          if (!startProcessingOutcomeHandled) {
+            setStatus(
+              startProcessingPromise && !sawEngineProgress
+                ? 'Preparing'
+                : status.paused ? 'Paused' : 'Running'
+            );
+          }
           return;
         }
 
-        if (observedRunning && !completionHandled) {
+        if (observedRunning && !completionHandled && !startProcessingOutcomeHandled) {
           completionHandled = true;
           const report = await callCommand('get_report', {});
           if (!active) return;
@@ -92,6 +111,7 @@ export default function ProgressPage() {
             setError('Preferences have not finished loading.');
             return;
           }
+          startProcessingOutcomeHandled = false;
           setStatus('Preparing');
           startProcessingPromise = callCommand('start_processing', { settings });
         }
@@ -131,36 +151,76 @@ export default function ProgressPage() {
   };
   const percent = run.percent;
   const speed = run.bytesPerSecond / 1_000_000;
+  const progressIndeterminate = run.status === 'Preparing' || run.stage !== null || run.total === 0;
+  const stageCount = run.stageItemsTotal === null
+    ? 'Preparing…'
+    : `${(run.stageItemsDone ?? 0).toLocaleString()} of ${run.stageItemsTotal.toLocaleString()} items`;
+  const progressCount = run.stage
+    ? stageCount
+    : run.status === 'Preparing'
+      ? 'Preparing…'
+      : `${run.completed.toLocaleString()} of ${run.total.toLocaleString()} files`;
+  const terminalStatus = run.status === 'Failed'
+    || run.status === 'Blocked'
+    || run.status === 'Cancelled';
 
   return (
     <PageFrame
+      className="progress-page-frame"
       title="Fixing your photos"
       subtitle="Originals are never modified."
       footer={
         <>
           <span className="footer-note">{run.status}</span>
           <div className="footer-buttons">
-            <Button onClick={() => void togglePause()}>
-              {paused ? <Play size={14} /> : <Pause size={14} />}{paused ? 'Resume' : 'Pause'}
-            </Button>
-            <Button onClick={() => void cancel()}><X size={14} />Cancel</Button>
+            {terminalStatus ? (
+              <Button variant="accent" onClick={() => navigate('/preferences')}>Back to preferences</Button>
+            ) : (
+              <>
+                <Button disabled={run.status === 'Ready' || run.status === 'Preparing' || run.status === 'Cancelling'} onClick={() => void togglePause()}>
+                  {paused ? <Play size={14} /> : <Pause size={14} />}{paused ? 'Resume' : 'Pause'}
+                </Button>
+                <Button disabled={run.status === 'Ready' || run.status === 'Cancelling'} onClick={() => void cancel()}>
+                  <X size={14} />Cancel
+                </Button>
+              </>
+            )}
           </div>
         </>
       }
     >
+      {terminalStatus && error ? (
+        <section className="panel progress-error" role="alert">
+          <AlertTriangle className="progress-error__icon" size={22} aria-hidden="true" />
+          <div>
+            <h2>{run.status === 'Blocked' ? 'Processing is blocked' : run.status === 'Cancelled' ? 'Processing cancelled' : 'Processing failed'}</h2>
+            <p>{error}</p>
+          </div>
+        </section>
+      ) : null}
       <Panel className="progress-card">
         <div className="progress-current">
           <div className="progress-top">
             <div>
               <span className="eyebrow">CURRENT FILE</span>
-              <h2>{run.currentFile || 'Preparing files…'}</h2>
+              <h2>{run.stage ?? (run.status === 'Preparing' ? 'Preparing files…' : run.currentFile || 'Preparing files…')}</h2>
             </div>
-            <strong className="progress-percent">{percent}%</strong>
+            <strong className="progress-percent">{progressIndeterminate ? '—' : `${percent}%`}</strong>
           </div>
           <div>
-            <div className="progress-count">{run.completed.toLocaleString()} of {run.total.toLocaleString()} files</div>
-            <div className="progress-meter" role="progressbar" aria-label="Files fixed" aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100}>
-              <span style={{ width: `${percent}%` }} />
+            <div className="progress-count">
+              {progressCount}
+            </div>
+            <div
+              className={`progress-meter${progressIndeterminate ? ' progress-meter--indeterminate' : ''}`}
+              role="progressbar"
+              aria-label={run.stage ? `Preparation: ${run.stage}` : 'Files fixed'}
+              aria-valuenow={progressIndeterminate ? undefined : percent}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuetext={run.stage ?? undefined}
+            >
+              <span style={progressIndeterminate ? undefined : { width: `${percent}%` }} />
             </div>
           </div>
         </div>
@@ -173,7 +233,7 @@ export default function ProgressPage() {
           <Button className="small-button" onClick={() => navigate('/report')}>View</Button>
         </Metric>
       </div>
-      {error ? <p role="alert" className="form-error">{error}</p> : null}
+      {error && !terminalStatus ? <p role="alert" className="form-error">{error}</p> : null}
     </PageFrame>
   );
 }

@@ -40,6 +40,9 @@ export type RunState = {
   total: number;
   percent: number;
   status: string;
+  stage: string | null;
+  stageItemsDone: number | null;
+  stageItemsTotal: number | null;
   currentFile: string;
   warnings: string[];
   lastEventAt: number | null;

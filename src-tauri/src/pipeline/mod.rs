@@ -8,6 +8,7 @@ use crate::planner::{MediaItem, Placement, PlacementKind};
 #[serde(rename_all = "camelCase")]
 pub struct ProcessingStartResult {
     pub accepted: bool,
+    pub cancelled: bool,
     pub required_bytes: u64,
     pub free_bytes: u64,
     pub shortfall_bytes: u64,

@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::{ipc::Channel, Manager, State};
 
 #[derive(Clone, Default)]
@@ -29,25 +29,98 @@ struct ActiveScan {
 
 static NEXT_SCAN_ID: AtomicU64 = AtomicU64::new(1);
 static PROCESSING_RUNNING: AtomicBool = AtomicBool::new(false);
+static PROCESSING_CANCEL_FLAG: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 
-struct ProcessingRunGuard;
+struct ProcessingRunGuard {
+    cancelled: Arc<AtomicBool>,
+}
 
 impl ProcessingRunGuard {
     fn acquire() -> Option<Self> {
-        PROCESSING_RUNNING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Self)
+        let mut active = PROCESSING_CANCEL_FLAG.lock().ok()?;
+        if active.is_some() || PROCESSING_RUNNING.load(Ordering::Acquire) {
+            return None;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *active = Some(cancelled.clone());
+        PROCESSING_RUNNING.store(true, Ordering::Release);
+        Some(Self { cancelled })
     }
 
     fn is_running() -> bool {
         PROCESSING_RUNNING.load(Ordering::Acquire)
     }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn request_cancel() -> std::result::Result<bool, String> {
+        let active = PROCESSING_CANCEL_FLAG
+            .lock()
+            .map_err(|error| format!("processing state is unavailable: {error}"))?;
+        if let Some(cancelled) = active.as_ref() {
+            cancelled.store(true, Ordering::Release);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 impl Drop for ProcessingRunGuard {
     fn drop(&mut self) {
-        PROCESSING_RUNNING.store(false, Ordering::Release);
+        match PROCESSING_CANCEL_FLAG.lock() {
+            Ok(mut active) => {
+                *active = None;
+                PROCESSING_RUNNING.store(false, Ordering::Release);
+            }
+            Err(error) => {
+                eprintln!("Could not clear processing state: {error}");
+                PROCESSING_RUNNING.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
+const PREPARATION_CANCELLED_MESSAGE: &str = "Processing was cancelled before it started.";
+
+fn emit_preparation_progress(
+    app: &tauri::AppHandle,
+    last_emitted: &mut Option<Instant>,
+    stage: &str,
+    items_total: Option<u64>,
+) -> Result<()> {
+    const MIN_INTERVAL: Duration = Duration::from_millis(250);
+    if let Some(last) = last_emitted.as_ref() {
+        let elapsed = last.elapsed();
+        if elapsed < MIN_INTERVAL {
+            std::thread::sleep(MIN_INTERVAL - elapsed);
+        }
+    }
+
+    crate::events::emit_processing_progress(
+        app,
+        &crate::events::ProcessingProgressEvent {
+            stage: Some(stage.to_string()),
+            items_done: Some(0),
+            items_total,
+            ..Default::default()
+        },
+    )?;
+    *last_emitted = Some(Instant::now());
+    Ok(())
+}
+
+fn cancelled_processing_result() -> ProcessingStartResult {
+    ProcessingStartResult {
+        accepted: false,
+        cancelled: true,
+        required_bytes: 0,
+        free_bytes: 0,
+        shortfall_bytes: 0,
+        warnings: vec![PREPARATION_CANCELLED_MESSAGE.to_string()],
+        report: None,
     }
 }
 
@@ -331,6 +404,14 @@ pub async fn start_processing(
     let index = preview_state.0.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _running_guard = running_guard;
+        let mut last_stage_event = None;
+        if _running_guard.is_cancelled() {
+            return Ok(cancelled_processing_result());
+        }
+        emit_preparation_progress(&app, &mut last_stage_event, "Reading index", None)?;
+        if _running_guard.is_cancelled() {
+            return Ok(cancelled_processing_result());
+        }
         let (mut entries, all_entries, expanded_source_paths) = {
             let mut guard = index
                 .lock()
@@ -346,9 +427,27 @@ pub async fn start_processing(
             guard.cached_preview = None;
             (entries, all_entries, source_paths)
         };
+        if _running_guard.is_cancelled() {
+            return Ok(cancelled_processing_result());
+        }
         hydrate_live_video_durations(&mut entries).map_err(AppError::Other)?;
+        if _running_guard.is_cancelled() {
+            return Ok(cancelled_processing_result());
+        }
+        emit_preparation_progress(
+            &app,
+            &mut last_stage_event,
+            "Finding duplicates",
+            Some(entries.len() as u64),
+        )?;
+        if _running_guard.is_cancelled() {
+            return Ok(cancelled_processing_result());
+        }
         let input_locators = build_input_locators(&entries).map_err(AppError::Other)?;
         let items = items_from_entries(entries, settings.time_zone).map_err(AppError::Other)?;
+        if _running_guard.is_cancelled() {
+            return Ok(cancelled_processing_result());
+        }
         if items.is_empty() {
             return Err(AppError::Other(
                 "The scanned sources contain no supported photo or video files.".to_string(),
@@ -360,6 +459,9 @@ pub async fn start_processing(
             .picture_dir()
             .map_err(|error| AppError::Other(format!("Could not locate the Pictures folder: {error}")))?;
         let output_root = resolve_output_root(&settings, &pictures)?;
+        if _running_guard.is_cancelled() {
+            return Ok(cancelled_processing_result());
+        }
         crate::platform::cleanup_takeback_temporary_files(&output_root)
             .map_err(AppError::Other)?;
         let manifest_path = app_config_file(&app, "run-manifest.sqlite")?;
@@ -367,12 +469,24 @@ pub async fn start_processing(
             RunManifest::open(&manifest_path, &output_root).map_err(AppError::Other)?;
         let planner_settings =
             PlannerSettings::from_preferences(&settings, Some(output_root.as_path()));
+        emit_preparation_progress(
+            &app,
+            &mut last_stage_event,
+            "Planning folders",
+            Some(items.len() as u64),
+        )?;
+        if _running_guard.is_cancelled() {
+            return Ok(cancelled_processing_result());
+        }
         let placements = plan_with_manifest_output(
             &items,
             &planner_settings,
             &output_root,
             &manifest,
         )?;
+        if _running_guard.is_cancelled() {
+            return Ok(cancelled_processing_result());
+        }
         let archives_to_delete = archives_with_complete_coverage(
             &items,
             &placements,
@@ -385,6 +499,18 @@ pub async fn start_processing(
         } else {
             placements_requiring_processing(&items, &placements, &output_root, &manifest)?
         };
+        if _running_guard.is_cancelled() {
+            return Ok(cancelled_processing_result());
+        }
+        emit_preparation_progress(
+            &app,
+            &mut last_stage_event,
+            "Checking disk space",
+            Some(items.len() as u64),
+        )?;
+        if _running_guard.is_cancelled() {
+            return Ok(cancelled_processing_result());
+        }
         let required_bytes = if settings.dry_run {
             0
         } else {
@@ -394,10 +520,14 @@ pub async fn start_processing(
         let free_bytes = crate::platform::disk_free_bytes(&output_root)
             .map_err(AppError::Other)?;
         let shortfall_bytes = required_bytes.saturating_sub(free_bytes);
+        if _running_guard.is_cancelled() {
+            return Ok(cancelled_processing_result());
+        }
 
         if shortfall_bytes > 0 {
             return Ok(ProcessingStartResult {
                 accepted: false,
+                cancelled: false,
                 required_bytes,
                 free_bytes,
                 shortfall_bytes,
@@ -409,6 +539,9 @@ pub async fn start_processing(
             });
         }
 
+        if _running_guard.is_cancelled() {
+            return Ok(cancelled_processing_result());
+        }
         save_settings_file(&app, &settings)?;
         let needs_exiftool = items.iter().any(|item| {
             item.metadata.is_some()
@@ -424,6 +557,9 @@ pub async fn start_processing(
         } else {
             PathBuf::new()
         };
+        if _running_guard.is_cancelled() {
+            return Ok(cancelled_processing_result());
+        }
         let started = std::time::Instant::now();
         let summary = engine::start_indexed_run_with_manifest(
             &app,
@@ -434,6 +570,7 @@ pub async fn start_processing(
             archives_to_delete.clone(),
             &exiftool_path,
             manifest,
+            &_running_guard.cancelled,
         )
         .map_err(AppError::Other)?;
 
@@ -466,6 +603,7 @@ pub async fn start_processing(
 
         Ok(ProcessingStartResult {
             accepted: true,
+            cancelled: false,
             required_bytes,
             free_bytes,
             shortfall_bytes: 0,
@@ -479,6 +617,7 @@ pub async fn start_processing(
 
 #[tauri::command]
 pub fn cancel_processing() -> Result<bool> {
+    ProcessingRunGuard::request_cancel().map_err(AppError::Other)?;
     engine::cancel_run().map_err(AppError::Other)?;
     Ok(true)
 }
@@ -1403,9 +1542,14 @@ mod tests {
     fn processing_guard_allows_only_one_active_run() {
         let guard = ProcessingRunGuard::acquire().expect("acquire processing guard");
         assert!(ProcessingRunGuard::is_running());
+        assert!(!guard.is_cancelled());
         assert!(ProcessingRunGuard::acquire().is_none());
+        assert!(ProcessingRunGuard::request_cancel().expect("request processing cancellation"));
+        assert!(guard.is_cancelled());
         drop(guard);
         assert!(!ProcessingRunGuard::is_running());
+        let next_guard = ProcessingRunGuard::acquire().expect("acquire next processing guard");
+        assert!(!next_guard.is_cancelled());
     }
 
     fn write_index_test_archive(path: &Path, entries: &[(&str, &[u8])]) {
